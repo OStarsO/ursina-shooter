@@ -1,0 +1,59 @@
+name: release
+
+# 推 v* 标签时自动构建 Windows exe 并附到 Release；
+# 也可在 Actions 页面手动 Run workflow（仅构建，不发布）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "PySide6>=6.5,<7" "pyinstaller>=6.0"
+
+      - name: Build launcher exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "射击启动器" `
+            --icon "assets/icon.ico" --distpath dist --workpath build --specpath build `
+            --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets `
+            --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick `
+            --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtMultimedia `
+            --exclude-module PySide6.QtCharts --exclude-module PySide6.QtPdf `
+            --exclude-module tkinter launcher.py
+
+      - name: Smoke test (compile)
+        run: python -m py_compile app_style.py room_net.py net_ui.py launcher.py 射击.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shooting-launcher
+          path: dist/*.exe
+
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
+          body: |
+            射击启动器（Windows x64，单文件免安装）
+
+            运行前提：本机已安装 Python 3.11 / 3.12 且装了 ursina；
+            或在启动器里点「修复环境」自动创建虚拟环境。
+
+            许可证：PolyForm Noncommercial 1.0.0（仅限非商业用途）。

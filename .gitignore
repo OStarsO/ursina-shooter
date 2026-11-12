@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ---- 构建产物 ----
+dist/
+build/
+build_launcher/
+*.spec
+*.manifest
+
+# ---- 运行时生成 ----
+logs/
+*.log
+settings.json
+scores.json
+hit.wav
+hit.ogg
+# 程序化生成的 UI 贴图，运行时重建
+ui_cache/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 本地产物与代理工作数据 ----
+.workbuddy/
