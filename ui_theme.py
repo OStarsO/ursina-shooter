@@ -30,6 +30,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter
 from ursina import Button, Entity, Text, camera, color, time, window
 
+import glass as _glass
+
 # ------------------------------------------------------------------ 配色
 # 参考 CS:GO HUD：深蓝灰面板 + 冷白文字 + 琥珀强调 + 双阵营色
 C_VOID = (4, 6, 9)
@@ -244,6 +246,27 @@ def _tex_corner() -> str:
     return _save(img, 'corner.png')
 
 
+def _tex_scope_mask() -> str:
+    """狙击镜遮罩：黑底 + 中央透明圆孔（软边）。
+    贴图是正方形，挂在与屏高等方的 quad 上 → 圆在任何分辨率/宽高比都是正圆。"""
+    s = 512
+    img = Image.new('RGBA', (s, s), (2, 3, 6, 255))
+    dr = ImageDraw.Draw(img)
+    c = s / 2
+    for i in range(10):                     # 软边圆孔
+        r = 236 + i
+        a = int(255 * (1 - i / 9))
+        dr.ellipse([c - r, c - r, c + r, c + r], outline=(2, 3, 6, 0) if a == 0
+                   else (2, 3, 6, a), width=2)
+    # 简化：直接把圆内区域挖空，再叠一层软边
+    hole = Image.new('L', (s, s), 0)
+    ImageDraw.Draw(hole).ellipse([c - 240, c - 240, c + 240, c + 240], fill=255)
+    hole = hole.filter(ImageFilter.GaussianBlur(3))
+    base = Image.new('RGBA', (s, s), (2, 3, 6, 255))
+    img = Image.composite(Image.new('RGBA', (s, s), (0, 0, 0, 0)), base, hole)
+    return _save(img, 'scope_mask.png')
+
+
 TEX = {}
 
 
@@ -261,6 +284,7 @@ def _build_textures():
         'ic_bullet': _icon_bullet(),
         'ic_arrow': _icon_arrow(),
         'corner': _tex_corner(),
+        'scope_mask': _tex_scope_mask(),
     })
 
 
@@ -337,12 +361,12 @@ class Surface(Entity):
 
 
 class Panel(Surface):
-    """CS:GO 式面板：深色底 + 顶部受光 + 细噪点 + 1px 描边 + 可选角标。"""
+    """CS:GO 式面板：毛玻璃底（失败退化为纯色）+ 顶部受光 + 细噪点 + 1px 描边。"""
 
     def __init__(self, parent, w, h, x=0.0, y=0.0, z=0.0, *,
                  fill=C_PANEL, alpha=246, border=True, border_col=C_LINE,
                  sheen=True, noise=True, accent_top=False, brackets=False,
-                 shadow=True, **kwargs):
+                 shadow=True, glass=True, **kwargs):
         super().__init__(parent, w, h, x, y, z, **kwargs)
         self.panel_col = fill
         self.panel_alpha = alpha
@@ -352,8 +376,18 @@ class Panel(Surface):
                    scale=(w * 1.18, h * 1.6), position=(0, -px(2), 0.004),
                    color=rgba((0, 0, 0), 110))
 
-        self.bg = Entity(parent=self, model='quad', scale=(w, h), z=0.0,
-                         color=rgba(fill, alpha))
+        # 毛玻璃底：采样低分辨率场景缓冲（毛玻璃不可用时退化纯色）
+        self._glass_tint = (0.32, 0.35, 0.41)
+        if glass:
+            self.bg = _glass.glass_quad(
+                self, w, h, alpha=max(0.45, min(0.88, alpha / 255 * 0.85)),
+                tint=self._glass_tint)
+        else:
+            self.bg = None
+        self._bg_is_glass = self.bg is not None and glass
+        if self.bg is None:
+            self.bg = Entity(parent=self, model='quad', scale=(w, h), z=0.0,
+                             color=rgba(fill, alpha))
         if sheen:
             Entity(parent=self, model='quad', texture=TEX['sheen'],
                    scale=(w, h), z=-0.001, color=rgba((255, 255, 255), 140))
@@ -382,7 +416,13 @@ class Panel(Surface):
                 e.rotation_z = rot
 
     def set_alpha(self, alpha):
-        self.bg.color = rgba(self.panel_col, alpha)
+        if self._bg_is_glass:
+            from panda3d.core import Vec4
+            r, g, b = self._glass_tint
+            self.bg.setShaderInput('k_tint', Vec4(r, g, b,
+                                                  max(0.0, min(1.0, alpha))))
+        else:
+            self.bg.color = rgba(self.panel_col, alpha)
 
 
 class KeyCap(Surface):
@@ -392,6 +432,7 @@ class KeyCap(Surface):
         h = px(h_px)
         w = max(h * 1.02, px(h_px * (0.60 * len(key) + 0.46)))
         super().__init__(parent, w, h, x, y, -0.02)
+        self.w, self.h = w, h          # 供外部排版取值（scale 恒为 1，读不到宽度）
         Entity(parent=self, model='quad', scale=(w, h), color=rgba((23, 31, 40), 246))
         t = BT * 1.1
         for bw, bh, bx, by in ((w, t, 0, h / 2 - t / 2), (w, t, 0, -h / 2 + t / 2),

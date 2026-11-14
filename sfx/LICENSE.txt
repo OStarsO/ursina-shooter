@@ -1,0 +1,24 @@
+sfx 音效授权说明
+================
+
+全部音效为项目原创、Python 标准库程序合成（wave + 数学函数），
+版权归本项目，等同 CC0，可自由商用与再分发：
+
+  - hitmark.wav        命中标记音（衰减正弦"叮"）
+  - reload.wav         换弹起始音（方波+噪声双咔嗒）
+  - reload_done.wav    装弹到位音（弹匣入仓"咔"）*
+  - switch_gun.wav     切枪音（布料摩擦 swish + 两次机械咔嗒）
+  - switch_knife.wav   切刀音（金属鞘声：高频泛音簇快衰减）
+  - shot_usp.wav       USP 枪声（420→240Hz 清脆短促"啵"）
+  - shot_deagle.wav    沙鹰枪声（180→70Hz 厚重炮吼 + 强瞬态）
+  - shot_ak.wav        AK-47 枪声（220→90Hz 连发脆响 + 拉栓咔嗒）
+  - shot_awm.wav       AWM 枪声（110→45Hz 低频轰鸣 + 远程回声尾）
+  - shot_knife.wav     匕首挥砍音（带通噪声扫掠 + 切割瞬态）
+
+  * reload_done.wav 基于 OpenGameArt「Gun Reload Sound Effects」
+    （Brian MacIntosh，CC0 公有领域，免费商用、无需署名）的录音素材
+    峰值归一化 + 3ms 淡入淡出加工而成，源页：
+    https://opengameart.org/content/gun-reload-sound-effects
+
+生成脚本见 tools/make_sfx.py（可复现全部合成音效）。
+若替换或重新生成音效，请保留本说明。

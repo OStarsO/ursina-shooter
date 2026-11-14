@@ -176,15 +176,92 @@ def main():
     check("机器人受人数上限约束", ok and sum(1 for m in team.member_list() if m["is_bot"]) == 9, text)
     ok, text = team.execute_command("bot add 红 5")
     check("满员后拒绝加机器人", (not ok) or sum(1 for m in team.member_list() if m["is_bot"]) == 9, text)
+    team.execute_command("bot clear")
+    ok, text = team.execute_command("bot add 蓝 2 困难")
+    bots = [m for m in team.member_list() if m["is_bot"]]
+    check("机器人带难度字段", ok and all(m.get("difficulty") == "hard" for m in bots), text)
     ok, text = team.execute_command("bot clear")
     check("清空机器人", ok and not any(m["is_bot"] for m in team.member_list()), text)
     team.stop()
+
+    test_anticheat()
 
     print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
     if FAIL:
         print("失败项:", FAIL)
         return 1
     return 0
+
+
+def test_anticheat():
+    """服务器端命中声明验证：射速 / 伤害 / 部位 / 存活 / 身份。"""
+    import anticheat as AC
+
+    ac = AC.AntiCheat()
+    ac.begin_round([1, 2, 3])                     # 1=玩家 2/3=其他
+    now = 1000.0
+
+    # 合法命中：AK 命中头部 = 36 × 4 = 144 → 一击击倒
+    ok, reason, dmg, kill = ac.claim(1, 2, "ak", "head", now)
+    check("AK 爆头伤害权威计算", ok and abs(dmg - 144.0) < 1e-6 and kill, f"dmg={dmg}")
+    check("击杀记入战绩", ac.stats_public()["1"]["kills"] == 1
+          and ac.stats_public()["2"]["deaths"] == 1)
+    check("击倒后进入重生窗口", not ac.is_alive(2, now + 0.1))
+
+    # 鞭尸：重生窗口内的命中被拒绝
+    ok, reason, dmg, kill = ac.claim(1, 2, "ak", "body", now + 0.2)
+    check("重生窗口内命中被拒", not ok and reason == AC.RejectReason.ALIVE)
+
+    # 重生后恢复
+    check("重生完成恢复满血", ac.respawn_done(2, now + 3.5)
+          and ac.is_alive(2, now + 3.5))
+
+    # 射速节流：AK 600rpm → 最小间隔 0.1s×0.9；0.05s 内第二发被拒
+    ok1, _, _, _ = ac.claim(1, 2, "ak", "body", now + 4.0)
+    ok2, reason, _, _ = ac.claim(1, 2, "ak", "body", now + 4.05)
+    check("AK 双发节流", ok1 and not ok2 and reason == AC.RejectReason.RATE)
+    ok3, _, _, _ = ac.claim(1, 2, "ak", "body", now + 4.2)
+    check("间隔足够后放行", ok3)
+
+    # 部位倍率：USP 34 → 肢体 25.5 / 躯干 42.5
+    _, _, dmg, _ = ac.claim(2, 1, "usp", "limb", now + 10.0)
+    check("USP 肢体倍率", abs(dmg - 25.5) < 1e-6, f"dmg={dmg}")
+    _, _, dmg, _ = ac.claim(2, 1, "usp", "body", now + 10.3)
+    check("USP 躯干倍率", abs(dmg - 42.5) < 1e-6, f"dmg={dmg}")
+
+    # 非法输入：未知武器 / 非法部位 / 自伤 / 伪造身份
+    ok, reason, _, _ = ac.claim(1, 2, "railgun", "body", now + 20.0)
+    check("未知武器被拒", not ok and reason == AC.RejectReason.WEAPON)
+    ok, reason, _, _ = ac.claim(1, 2, "ak", "toe", now + 20.0)
+    check("非法部位被拒", not ok and reason == AC.RejectReason.ZONE)
+    ok, reason, _, _ = ac.claim(1, 1, "ak", "body", now + 20.0)
+    check("自伤被拒", not ok and reason == AC.RejectReason.SELF)
+
+    # 房主代报人机命中：attack 指向 bot 成员 id，reporter 为房主本人
+    # （身份约束由 RoomService 连接层校验，anticheat 只管数值规则）
+    svc = rn.RoomService("房主", "duel")
+    svc.add_bots("blue", 1, "hard")
+    bot = next(m for m in svc.member_list() if m["is_bot"])
+    host = svc.host_member
+    svc.anticheat.begin_round(list(svc.members.keys()))
+    ok, reason, dmg, kill = svc.anticheat.claim(
+        bot["id"], host["id"], "ak", "body", now + 30.0, reporter_id=host["id"])
+    check("房主代报人机命中放行", ok and abs(dmg - 45.0) < 1e-6, f"dmg={dmg}")
+    # 人机射速同样受节流（0.05s 后的第二发）
+    ok, reason, _, _ = svc.anticheat.claim(
+        bot["id"], host["id"], "ak", "body", now + 30.05, reporter_id=host["id"])
+    check("人机射速同样受节流", not ok and reason == AC.RejectReason.RATE)
+    # 伪造身份（连接层）：非房主、非本人、也非人机的 attacker 被拒
+    thief = svc._add_member("贼", "red")
+    stats_before = svc.anticheat.stats_public()[str(host["id"])]["score"]
+    svc._handle_hit_claim(host, {"t": "hit_claim", "attacker": thief["id"],
+                                 "target": bot["id"], "weapon": "ak", "zone": "body"})
+    check("伪造身份被连接层拒绝",
+          svc.anticheat.stats_public()[str(host["id"])]["score"] == stats_before
+          and svc.anticheat.stats_public().get(str(thief["id"]), {}).get("score", 0) == 0)
+    svc.stop()
+
+    print(f"\n[anticheat] 小计: {len(PASS)} 项通过")
 
 
 def json_ok(args):

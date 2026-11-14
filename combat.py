@@ -5,19 +5,51 @@
 """
 from __future__ import annotations
 
+# ============================ 分部位伤害判定 ============================
+# 三区简化制（用户选定）：头部最高、胸+躯干统一 1.25、肢体（手臂/腿）0.75。
+# 木偶人与玩家角色使用同一套倍率与同一套结算入口。
+ZONE_MULTIPLIERS = {
+    'head': 4.0,     # 头部：一击致命区
+    'body': 1.25,    # 胸 + 躯干（腰腹）：火力集中区
+    'limb': 0.75,    # 手臂 / 腿：打肢体亏伤害
+}
+
+ZONE_CN = {'head': '头部', 'body': '躯干', 'limb': '肢体'}
+
+
+def zone_damage(base: float, zone: str) -> float:
+    """按部位换算最终伤害（未知部位按躯干算）。"""
+    return base * ZONE_MULTIPLIERS.get(zone, ZONE_MULTIPLIERS['body'])
+
+
+def classify_zone_by_height(height: float, player_height: float = 1.8) -> str:
+    """按命中点离地高度划分部位（玩家 / 人机通用，无实体分件时用）。
+
+    站姿 1.8 米：头部 ≈ 顶部 14%（≥1.55 米），躯干中段，肢体为下肢。
+    """
+    if height >= player_height * 0.86:      # ≥1.55
+        return 'head'
+    if height >= player_height * 0.42:      # ≥0.75
+        return 'body'
+    return 'limb'
+
 
 class Weapon:
-    """一把枪的弹药与射击节奏。"""
+    """一把枪的弹药、伤害与射击节奏。"""
 
     def __init__(self, name='GLOCK-18', mag_size=20, reserve=120, rpm=430,
-                 reload_time=2.1, auto=True):
+                 reload_time=2.1, auto=True, damage=25):
         self.name = name
         self.mag_size = mag_size
         self.mag = mag_size
         self.reserve = reserve
+        self.reserve_max = reserve
+        # 备弹无限（训练/对战都不需要补给，弹匣打完换弹即可）
+        self.infinite_reserve = False
         self.interval = 60.0 / max(1, rpm)
         self.reload_time = reload_time
         self.auto = auto
+        self.damage = damage
 
         self.cooldown = 0.0
         self.reloading = False
@@ -47,7 +79,9 @@ class Weapon:
         return True
 
     def start_reload(self) -> bool:
-        if self.reloading or self.mag >= self.mag_size or self.reserve <= 0:
+        if self.reloading or self.mag >= self.mag_size:
+            return False
+        if not self.infinite_reserve and self.reserve <= 0:
             return False
         self.reloading = True
         self.reload_left = self.reload_time
@@ -62,16 +96,19 @@ class Weapon:
         if self.reloading:
             self.reload_left -= dt
             if self.reload_left <= 0.0:
-                need = self.mag_size - self.mag
-                take = min(need, self.reserve)
-                self.mag += take
-                self.reserve -= take
+                if self.infinite_reserve:
+                    self.mag = self.mag_size       # 备弹无限：直接补满
+                else:
+                    need = self.mag_size - self.mag
+                    take = min(need, self.reserve)
+                    self.mag += take
+                    self.reserve -= take
                 self.reloading = False
                 self.reload_left = 0.0
 
     def refill(self):
         self.mag = self.mag_size
-        self.reserve = 120
+        self.reserve = self.reserve_max
         self.reloading = False
         self.reload_left = 0.0
         self.cooldown = 0.0
@@ -79,7 +116,68 @@ class Weapon:
     # -- 显示 ------------------------------------------------------
     @property
     def reserve_text(self) -> str:
-        return '∞' if self.reserve <= 0 and self.mag > 0 and self.reserve == -1 else str(self.reserve)
+        if self.infinite_reserve:
+            return '∞'
+        return str(self.reserve)
+
+
+class Melee:
+    """近战武器：没有弹药，只关心挥砍节奏、伤害与攻击距离。
+
+    属性与 Weapon 保持兼容（mag / reserve / reloading …），
+    这样 HUD 的生命周期不用为近战写第二套分支。
+    """
+
+    def __init__(self, name='刺刀', damage=55, rpm=110, reach=2.6):
+        self.name = name
+        self.damage = damage
+        self.reach = reach
+        self.interval = 60.0 / max(1, rpm)
+        self.cooldown = 0.0
+
+        # 兼容 HUD / 掉落逻辑
+        self.mag_size = 0
+        self.mag = 0
+        self.reserve = 0
+        self.reserve_max = 0
+        self.reload_time = 0.0
+        self.reloading = False
+        self.reload_left = 0.0
+        self.auto = False
+
+    @property
+    def empty(self) -> bool:
+        return False                     # 刀永远不会"没子弹"
+
+    @property
+    def reload_progress(self) -> float:
+        return 1.0
+
+    @property
+    def reserve_text(self) -> str:
+        return '—'                       # 近战无备弹概念（HUD 显示占位符）
+
+    def can_fire(self) -> bool:
+        return self.cooldown <= 0.0
+
+    def fire(self) -> bool:
+        """挥砍一次；返回是否成功（冷却中挥不出第二刀）。"""
+        if self.cooldown > 0.0:
+            return False
+        self.cooldown = self.interval
+        return True
+
+    def start_reload(self) -> bool:
+        return False
+
+    def cancel_reload(self):
+        pass
+
+    def update(self, dt: float):
+        self.cooldown = max(0.0, self.cooldown - dt)
+
+    def refill(self):
+        self.cooldown = 0.0
 
 
 class Player:

@@ -28,16 +28,17 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QPainter, QPen, QFont, QLinearGradient, QRadialGradient,
-    QPainterPath,
+    QPainterPath, QFontDatabase,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QGraphicsDropShadowEffect, QMessageBox, QComboBox, QSlider,
-    QGridLayout, QTextEdit, QSizePolicy, QDialog,
+    QGridLayout, QTextEdit, QSizePolicy, QDialog, QStackedWidget,
+    QLineEdit, QScrollArea, QButtonGroup,
 )
 
 from app_style import (
-    C_BG, C_PANEL, C_PANEL_2, C_BORDER, C_TEXT, C_MUTED, C_ACCENT, C_ACCENT_DIM,
+    C_PANEL, C_PANEL_2, C_BORDER, C_TEXT, C_MUTED, C_ACCENT, C_ACCENT_DIM,
     C_OK, C_WARN, C_BAD, C_INFO, FONT_FAMILY, FONT_FAMILY_MONO,
 )
 import room_net as rn
@@ -51,6 +52,23 @@ APP_VERSION = "1.1.0"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 
+# 数字 / 英文窄体（与游戏内同一套字体）
+FONT_DIR = BASE_DIR / "fonts"
+FONT_NUM = "Rajdhani"
+_fonts_loaded = False
+
+
+def _load_app_fonts():
+    global _fonts_loaded
+    if _fonts_loaded:
+        return
+    for font_name in ("Rajdhani-Bold.ttf", "Rajdhani-SemiBold.ttf",
+                      "BarlowCondensed-SemiBold.ttf"):
+        font_path = FONT_DIR / font_name
+        if font_path.is_file():
+            QFontDatabase.addApplicationFont(str(font_path))
+    _fonts_loaded = True
+
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "ShootingLauncher"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -59,6 +77,7 @@ DEFAULT_CONFIG = {
     "python_path": "",
     "last_good_python": "",
     "update_url": "",
+    "notice_url": "",
     "window_x": None,
     "window_y": None,
     "nickname": "",
@@ -426,8 +445,12 @@ class Card(QFrame):
 
         head = QHBoxLayout()
         head.setSpacing(8)
+        bar = QFrame()
+        bar.setFixedSize(3, 14)
+        bar.setStyleSheet(f"background:{C_ACCENT}; border-radius:2px;")
         self.title_label = QLabel(title)
         self.title_label.setObjectName("CardTitle")
+        head.addWidget(bar)
         head.addWidget(self.title_label)
         head.addStretch(1)
         self.head = head
@@ -435,6 +458,12 @@ class Card(QFrame):
         self.content = QVBoxLayout()
         self.content.setSpacing(6)
         self.body.addLayout(self.content)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(6, 10, 18, 70))
+        self.setGraphicsEffect(shadow)
 
 
 class ToggleSwitch(QWidget):
@@ -503,110 +532,6 @@ class ToggleSwitch(QWidget):
         p.drawEllipse(QRectF(knob_x, 3, 18, 18))
 
 
-class HeroPanel(QWidget):
-    """左侧主视觉：网格、光晕、旋转准星"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedWidth(392)
-        self._angle = 0.0
-        self._phase = 0.0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(40)
-
-    def _tick(self):
-        self._angle = (self._angle + 0.7) % 360
-        self._phase += 0.05
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-
-        # 只裁左侧两个圆角（右侧与主面板接壤，保持直角）
-        clip = QPainterPath()
-        clip.addRoundedRect(QRectF(0, 0, w + 16, h), 16, 16)
-        p.setClipPath(clip)
-
-        # 背景渐变
-        grad = QLinearGradient(0, 0, w, h)
-        grad.setColorAt(0, QColor("#131B29"))
-        grad.setColorAt(0.55, QColor("#0C1119"))
-        grad.setColorAt(1, QColor("#090C11"))
-        p.fillRect(self.rect(), grad)
-
-        # 网格
-        p.setPen(QPen(QColor(255, 255, 255, 8), 1))
-        step = 28
-        for x in range(0, w, step):
-            p.drawLine(x, 0, x, h)
-        for y in range(0, h, step):
-            p.drawLine(0, y, w, y)
-
-        # 光晕
-        cx, cy = w * 0.5, h * 0.36
-        glow = QRadialGradient(cx, cy, 210)
-        accent = QColor(C_ACCENT)
-        glow.setColorAt(0, QColor(accent.red(), accent.green(), accent.blue(), 46))
-        glow.setColorAt(0.6, QColor(accent.red(), accent.green(), accent.blue(), 12))
-        glow.setColorAt(1, QColor(0, 0, 0, 0))
-        p.setPen(Qt.NoPen)
-        p.setBrush(glow)
-        p.drawEllipse(QRectF(cx - 210, cy - 210, 420, 420))
-
-        # 准星
-        p.save()
-        p.translate(cx, cy)
-        pulse = 1.0 + 0.05 * math.sin(self._phase * 2)
-        radius = 78 * pulse
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 26), 1))
-        p.drawEllipse(QRectF(-radius, -radius, radius * 2, radius * 2))
-        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 120), 1.4))
-        p.drawEllipse(QRectF(-radius * 0.62, -radius * 0.62, radius * 1.24, radius * 1.24))
-
-        p.rotate(self._angle)
-        p.setPen(QPen(QColor(C_ACCENT), 2.2))
-        for i in range(4):
-            p.drawLine(0, -radius - 2, 0, -radius - 16)
-            p.rotate(90)
-        p.setPen(QPen(QColor(255, 255, 255, 90), 1))
-        for i in range(4):
-            p.drawLine(0, -radius * 0.62 + 12, 0, -radius * 0.62 + 26)
-            p.rotate(90)
-        p.restore()
-
-        # 中心点
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(C_ACCENT))
-        p.drawEllipse(QRectF(cx - 2.5, cy - 2.5, 5, 5))
-
-        # 标题
-        p.setPen(QColor(C_TEXT))
-        f = QFont(FONT_FAMILY, 0)
-        f.setPixelSize(44)
-        f.setWeight(QFont.Black)
-        p.setFont(f)
-        p.drawText(QRectF(36, h - 196, w - 72, 58), Qt.AlignLeft | Qt.AlignBottom, "射击")
-
-        p.setPen(QColor(C_ACCENT))
-        f2 = QFont("Consolas", 0)
-        f2.setPixelSize(12)
-        f2.setLetterSpacing(QFont.AbsoluteSpacing, 4)
-        p.setFont(f2)
-        p.drawText(QRectF(38, h - 130, w - 72, 20), Qt.AlignLeft, "SHOOTER  /  简约 3D")
-
-        # 分割线 + 底部信息
-        p.setPen(QPen(QColor(C_BORDER), 1))
-        p.drawLine(38, h - 96, w - 38, h - 96)
-        p.setPen(QColor(C_MUTED))
-        f3 = QFont(FONT_FAMILY, 0)
-        f3.setPixelSize(11)
-        p.setFont(f3)
-        p.drawText(QRectF(38, h - 78, w - 76, 18), Qt.AlignLeft, f"客户端 v{APP_VERSION}   ·   Powered by ursina")
-
 
 
 class LogBox(QTextEdit):
@@ -614,7 +539,8 @@ class LogBox(QTextEdit):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setObjectName("LogBox")
-        self.setFixedHeight(104)
+        self.setMinimumHeight(104)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFont(QFont(FONT_FAMILY_MONO, 9))
 
     def append_line(self, text):
@@ -627,6 +553,7 @@ class LogBox(QTextEdit):
 class LauncherWindow(QWidget):
     def __init__(self, nickname="玩家"):
         super().__init__()
+        _load_app_fonts()
         self.cfg = load_config()
         self.nickname = nickname or self.cfg.get("nickname") or "玩家"
         self.game_path = locate_game(self.cfg)
@@ -662,21 +589,21 @@ class LauncherWindow(QWidget):
                 font-size: 12px;
             }}
             QFrame#Card {{
-                background: {C_PANEL};
-                border: 1px solid {C_BORDER};
-                border-radius: 14px;
+                background: rgba(255, 255, 255, 0.055);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 18px;
             }}
             QLabel#CardTitle {{
-                color: {C_MUTED};
+                color: #B9C6D9;
                 font-size: 11px;
                 font-weight: 600;
-                letter-spacing: 1px;
+                letter-spacing: 1.5px;
             }}
             QLabel#Hint {{ color: {C_MUTED}; font-size: 11px; }}
             QLabel#BigScore {{
                 color: {C_ACCENT};
-                font-family: "Consolas";
-                font-size: 34px;
+                font-family: "{FONT_NUM}";
+                font-size: 38px;
                 font-weight: 700;
             }}
             QComboBox {{
@@ -711,11 +638,11 @@ class LauncherWindow(QWidget):
                 border-radius: 6px;
             }}
             QPushButton#Ghost {{
-                background: transparent;
-                border: 1px solid {C_BORDER};
+                background: rgba(255, 255, 255, 0.02);
+                border: 1px solid #2A3648;
                 border-radius: 8px;
                 padding: 6px 12px;
-                color: {C_MUTED};
+                color: #B9C6D9;
             }}
             QPushButton#Ghost:hover {{
                 border-color: {C_ACCENT};
@@ -747,9 +674,34 @@ class LauncherWindow(QWidget):
             QTextEdit#LogBox {{
                 background: {C_PANEL_2};
                 border: 1px solid {C_BORDER};
-                border-radius: 10px;
+                border-radius: 8px;
                 color: #9FB0C8;
                 padding: 8px;
+            }}
+            QLineEdit {{
+                background: {C_PANEL_2};
+                border: 1px solid {C_BORDER};
+                border-radius: 8px;
+                padding: 7px 10px;
+                color: {C_TEXT};
+                selection-background-color: {C_ACCENT_DIM};
+            }}
+            QLineEdit:focus {{ border-color: {C_ACCENT}; }}
+            QPushButton#NavBtn {{
+                background: transparent;
+                border: none;
+                border-bottom: 2px solid transparent;
+                border-radius: 0;
+                padding: 8px 14px;
+                color: {C_MUTED};
+                font-size: 13px;
+                letter-spacing: 1px;
+            }}
+            QPushButton#NavBtn:hover {{ color: {C_TEXT}; }}
+            QPushButton#NavBtn:checked {{
+                color: {C_ACCENT};
+                border-bottom-color: {C_ACCENT};
+                font-weight: 600;
             }}
         """)
 
@@ -758,24 +710,37 @@ class LauncherWindow(QWidget):
         shell = QVBoxLayout(self)
         shell.setContentsMargins(0, 0, 0, 0)
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
-        shell.addLayout(row)
-
-        self.hero = HeroPanel()
-        row.addWidget(self.hero)
-
         right = QVBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
-        row.addLayout(right, 1)
+        shell.addLayout(right)
 
         # 顶部栏
         top = QHBoxLayout()
         top.setContentsMargins(26, 14, 14, 6)
-        brand = QLabel("客户 端 控 制 台")
-        brand.setStyleSheet(f"color:{C_MUTED}; font-size:11px; letter-spacing:2px;")
+
+        brand = QWidget()
+        brand_lay = QHBoxLayout(brand)
+        brand_lay.setContentsMargins(0, 0, 0, 0)
+        brand_lay.setSpacing(10)
+        mark = QFrame()
+        mark.setFixedSize(28, 28)
+        mark.setStyleSheet(
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "stop:0 #FF7A45, stop:1 #FF9E6B); border-radius:9px;"
+        )
+        bt = QVBoxLayout()
+        bt.setSpacing(2)
+        bt_t = QLabel("射击")
+        bt_t.setStyleSheet("color:#EDF2FA; font-size:15px; font-weight:700; letter-spacing:2px;")
+        bt_s = QLabel(f"SHOOTER · v{APP_VERSION}")
+        bt_s.setStyleSheet(
+            f"color:{C_MUTED}; font-family:'{FONT_NUM}'; font-size:10px; letter-spacing:2px;"
+        )
+        bt.addWidget(bt_t)
+        bt.addWidget(bt_s)
+        brand_lay.addWidget(mark)
+        brand_lay.addLayout(bt)
         top.addWidget(brand)
         self.lbl_nick = QLabel(f"●  {self.nickname}")
         self.lbl_nick.setStyleSheet(
@@ -806,153 +771,34 @@ class LauncherWindow(QWidget):
         top.addWidget(self.btn_close)
         right.addLayout(top)
 
-        content = QVBoxLayout()
-        content.setContentsMargins(24, 8, 26, 6)
-        content.setSpacing(12)
-        right.addLayout(content, 1)
-
-        # ---- 环境状态 ----
-        env_card = Card("环境状态")
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self.btn_recheck = QPushButton("重新检测")
-        self.btn_recheck.setObjectName("Ghost")
-        self.btn_recheck.clicked.connect(self.start_env_check)
-        self.btn_repair = QPushButton("修复环境")
-        self.btn_repair.setObjectName("Ghost")
-        self.btn_repair.clicked.connect(self.repair_env)
-        self.btn_sound = QPushButton("补齐音效")
-        self.btn_sound.setObjectName("Ghost")
-        self.btn_sound.clicked.connect(self.generate_sound)
-        for b in (self.btn_recheck, self.btn_repair, self.btn_sound):
+        # 顶部导航菜单：公告 / 设置 / 控制台 / 我的
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        nav = QHBoxLayout()
+        nav.setContentsMargins(24, 2, 26, 4)
+        nav.setSpacing(4)
+        self.nav_buttons = {}
+        for key, title in (("notice", "公告"), ("settings", "设置"),
+                           ("console", "控制台"), ("profile", "我的")):
+            b = QPushButton(title)
+            b.setObjectName("NavBtn")
+            b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
-            btn_row.addWidget(b)
-        btn_row.addStretch(1)
-        env_card.head.addLayout(btn_row)
+            b.clicked.connect(lambda _=False, k=key: self._switch_page(k))
+            self.nav_group.addButton(b)
+            nav.addWidget(b)
+            self.nav_buttons[key] = b
+        nav.addStretch(1)
+        right.addLayout(nav)
 
-        self.row_python = StatusRow("解释器")
-        self.row_engine = StatusRow("引擎")
-        self.row_font = StatusRow("中文字体")
-        self.row_audio = StatusRow("音效")
-        for r in (self.row_python, self.row_engine, self.row_font, self.row_audio):
-            env_card.content.addWidget(r)
-        content.addWidget(env_card)
-
-        # ---- 游戏设置 ----
-        set_card = Card("游戏设置")
-        self.btn_reset = QPushButton("恢复默认")
-        self.btn_reset.setObjectName("Ghost")
-        self.btn_reset.setCursor(Qt.PointingHandCursor)
-        self.btn_reset.clicked.connect(self.reset_settings)
-        set_card.head.addWidget(self.btn_reset)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(9)
-
-        grid.addWidget(self._label("窗口尺寸"), 0, 0)
-        self.combo_size = QComboBox()
-        for w, h in ((1280, 720), (1600, 900), (1920, 1080), (2560, 1440)):
-            self.combo_size.addItem(f"{w} × {h}", (w, h))
-        self.combo_size.currentIndexChanged.connect(self.save_settings_from_ui)
-        grid.addWidget(self.combo_size, 0, 1)
-
-        grid.addWidget(self._label("全屏"), 0, 2)
-        self.sw_fullscreen = ToggleSwitch()
-        self.sw_fullscreen.toggled.connect(self.save_settings_from_ui)
-        grid.addWidget(self.sw_fullscreen, 0, 3, Qt.AlignLeft)
-
-        grid.addWidget(self._label("灵敏度"), 1, 0)
-        self.slider_sens = QSlider(Qt.Horizontal)
-        self.slider_sens.setRange(5, 120)
-        self.slider_sens.valueChanged.connect(self._on_sens_changed)
-        self.slider_sens.sliderReleased.connect(self.save_settings_from_ui)
-        grid.addWidget(self.slider_sens, 1, 1)
-        self.lbl_sens = QLabel("40")
-        self.lbl_sens.setFixedWidth(34)
-        self.lbl_sens.setStyleSheet(f"color:{C_MUTED}; font-family:Consolas;")
-        grid.addWidget(self.lbl_sens, 1, 2)
-
-        grid.addWidget(self._label("音量"), 2, 0)
-        self.slider_vol = QSlider(Qt.Horizontal)
-        self.slider_vol.setRange(0, 100)
-        self.slider_vol.valueChanged.connect(self._on_vol_changed)
-        self.slider_vol.sliderReleased.connect(self.save_settings_from_ui)
-        grid.addWidget(self.slider_vol, 2, 1)
-        self.lbl_vol = QLabel("100%")
-        self.lbl_vol.setFixedWidth(34)
-        self.lbl_vol.setStyleSheet(f"color:{C_MUTED}; font-family:Consolas;")
-        grid.addWidget(self.lbl_vol, 2, 2)
-
-        grid.setColumnStretch(1, 1)
-        set_card.content.addLayout(grid)
-        hint = QLabel("设置会写入 settings.json，下次启动游戏时生效")
-        hint.setObjectName("Hint")
-        set_card.content.addWidget(hint)
-        content.addWidget(set_card)
-
-        # ---- 底部两张卡 ----
-        bottom = QHBoxLayout()
-        bottom.setSpacing(12)
-
-        score_card = Card("战绩")
-        score_row = QHBoxLayout()
-        score_row.setSpacing(6)
-        score_col = QVBoxLayout()
-        score_col.setSpacing(0)
-        self.lbl_best = QLabel("0")
-        self.lbl_best.setObjectName("BigScore")
-        score_col.addWidget(self.lbl_best)
-        cap = QLabel("历史最高分")
-        cap.setObjectName("Hint")
-        score_col.addWidget(cap)
-        score_row.addLayout(score_col)
-        score_row.addStretch(1)
-        info_col = QVBoxLayout()
-        info_col.setSpacing(2)
-        self.lbl_last = QLabel("最近一局  —")
-        self.lbl_last.setStyleSheet(f"color:{C_TEXT}; font-size:12px;")
-        self.lbl_when = QLabel("—")
-        self.lbl_when.setObjectName("Hint")
-        info_col.addWidget(self.lbl_last)
-        info_col.addWidget(self.lbl_when)
-        info_col.addStretch(1)
-        score_row.addLayout(info_col)
-        score_card.content.addLayout(score_row)
-        bottom.addWidget(score_card, 1)
-
-        about_card = Card("客户端")
-        ver_row = QHBoxLayout()
-        ver_row.addWidget(self._label(f"版本 {APP_VERSION}"))
-        ver_row.addStretch(1)
-        self.btn_update = QPushButton("检查更新")
-        self.btn_update.setObjectName("Ghost")
-        self.btn_update.setCursor(Qt.PointingHandCursor)
-        self.btn_update.clicked.connect(self.check_update)
-        ver_row.addWidget(self.btn_update)
-        about_card.content.addLayout(ver_row)
-
-        quick = QHBoxLayout()
-        quick.setSpacing(8)
-        for text, handler in (
-            ("打开目录", self.open_game_dir),
-            ("查看日志", self.open_log_dir),
-            ("打开配置", self.open_settings_file),
-        ):
-            b = QPushButton(text)
-            b.setObjectName("Ghost")
-            b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(handler)
-            quick.addWidget(b)
-        about_card.content.addLayout(quick)
-        bottom.addWidget(about_card, 1)
-        content.addLayout(bottom)
-        content.addStretch(1)
-
-        # ---- 日志抽屉 ----
-        self.log_box = LogBox()
-        self.log_box.setVisible(False)
-        content.addWidget(self.log_box)
+        # 页面栈
+        self.stack = QStackedWidget()
+        right.addWidget(self.stack, 1)
+        self.stack.addWidget(self._build_notice_page())
+        self.stack.addWidget(self._build_settings_page())
+        self.stack.addWidget(self._build_console_page())
+        self.stack.addWidget(self._build_profile_page())
+        self._switch_page("settings")
 
         # ---- 底栏 ----
         bar = QHBoxLayout()
@@ -972,10 +818,10 @@ class LauncherWindow(QWidget):
         bar.addLayout(status_col)
         bar.addStretch(1)
 
-        self.btn_log = QPushButton("日志")
+        self.btn_log = QPushButton("控制台")
         self.btn_log.setObjectName("Ghost")
         self.btn_log.setCursor(Qt.PointingHandCursor)
-        self.btn_log.clicked.connect(self.toggle_log)
+        self.btn_log.clicked.connect(lambda: self._switch_page("console"))
         bar.addWidget(self.btn_log)
 
         self.btn_launch = QPushButton("开 始 游 戏")
@@ -1012,6 +858,301 @@ class LauncherWindow(QWidget):
         bar.addWidget(self.btn_launch)
         right.addLayout(bar)
 
+    # ---------- 页面框架 ----------
+    PAGE_KEYS = ("notice", "settings", "console", "profile")
+
+    def _wrap_page(self, content_widget):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea{background:transparent; border:none;}"
+            "QScrollArea > QWidget > QWidget{background:transparent;}"
+        )
+        scroll.setWidget(content_widget)
+        return scroll
+
+    def _switch_page(self, key):
+        if key not in self.PAGE_KEYS:
+            return
+        self.stack.setCurrentIndex(self.PAGE_KEYS.index(key))
+        btn = self.nav_buttons.get(key)
+        if btn:
+            btn.setChecked(True)
+
+    # ---------- 公告页 ----------
+    DEFAULT_NOTICES = [
+        ("2026-11-12", "v1.1.0 客户端更新",
+         "主界面顶部新增「公告 / 设置 / 控制台 / 我的」导航；环境自检、游戏设置、战绩与联机入口已按页面归类。"),
+        ("2026-11-12", "玩法提示",
+         "WASD 移动，空格跳跃，左键射击，R 换弹，按住 Tab 查看计分板，ESC 打开暂停菜单。"),
+        ("2026-11-12", "联机说明",
+         "同一局域网内可建房或加入房间（TCP 25250）；进入对局后的位置 / 命中 / 比分同步仍在开发中。"),
+    ]
+
+    def _build_notice_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 8, 26, 6)
+        lay.setSpacing(12)
+        card = Card("公告")
+        self.notice_layout = QVBoxLayout()
+        self.notice_layout.setSpacing(12)
+        card.content.addLayout(self.notice_layout)
+        lay.addWidget(card)
+        lay.addStretch(1)
+        for date, title, body in self.DEFAULT_NOTICES:
+            self._add_notice(date, title, body)
+        # 预留：cfg["notice_url"] 配置后可在此拉取远程公告并追加
+        return self._wrap_page(page)
+
+    def _add_notice(self, date, title, body):
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        head = QHBoxLayout()
+        t = QLabel(title)
+        t.setStyleSheet(f"color:{C_TEXT}; font-size:13px; font-weight:600;")
+        d = QLabel(date)
+        d.setObjectName("Hint")
+        head.addWidget(t)
+        head.addStretch(1)
+        head.addWidget(d)
+        b = QLabel(body)
+        b.setObjectName("Hint")
+        b.setWordWrap(True)
+        box.addLayout(head)
+        box.addWidget(b)
+        self.notice_layout.addLayout(box)
+
+    # ---------- 设置页 ----------
+    def _build_settings_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 8, 26, 6)
+        lay.setSpacing(12)
+
+        # ---- 环境状态 ----
+        env_card = Card("环境状态")
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.btn_recheck = QPushButton("重新检测")
+        self.btn_recheck.setObjectName("Ghost")
+        self.btn_recheck.clicked.connect(self.start_env_check)
+        self.btn_repair = QPushButton("修复环境")
+        self.btn_repair.setObjectName("Ghost")
+        self.btn_repair.clicked.connect(self.repair_env)
+        self.btn_sound = QPushButton("补齐音效")
+        self.btn_sound.setObjectName("Ghost")
+        self.btn_sound.clicked.connect(self.generate_sound)
+        for b in (self.btn_recheck, self.btn_repair, self.btn_sound):
+            b.setCursor(Qt.PointingHandCursor)
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        env_card.head.addLayout(btn_row)
+
+        self.row_python = StatusRow("解释器")
+        self.row_engine = StatusRow("引擎")
+        self.row_font = StatusRow("中文字体")
+        self.row_audio = StatusRow("音效")
+        for r in (self.row_python, self.row_engine, self.row_font, self.row_audio):
+            env_card.content.addWidget(r)
+        lay.addWidget(env_card)
+
+        # ---- 游戏设置 ----
+        set_card = Card("游戏设置")
+        self.btn_reset = QPushButton("恢复默认")
+        self.btn_reset.setObjectName("Ghost")
+        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.clicked.connect(self.reset_settings)
+        set_card.head.addWidget(self.btn_reset)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(9)
+
+        grid.addWidget(self._label("窗口尺寸"), 0, 0)
+        self.combo_size = QComboBox()
+        for w, h in ((1280, 720), (1600, 900), (1920, 1080), (2560, 1440)):
+            self.combo_size.addItem(f"{w} × {h}", (w, h))
+        self.combo_size.currentIndexChanged.connect(self.save_settings_from_ui)
+        grid.addWidget(self.combo_size, 0, 1)
+
+        grid.addWidget(self._label("全屏"), 0, 2)
+        self.sw_fullscreen = ToggleSwitch()
+        self.sw_fullscreen.toggled.connect(self.save_settings_from_ui)
+        grid.addWidget(self.sw_fullscreen, 0, 3, Qt.AlignLeft)
+
+        grid.addWidget(self._label("灵敏度"), 1, 0)
+        self.slider_sens = QSlider(Qt.Horizontal)
+        self.slider_sens.setRange(5, 120)
+        self.slider_sens.valueChanged.connect(self._on_sens_changed)
+        self.slider_sens.sliderReleased.connect(self.save_settings_from_ui)
+        grid.addWidget(self.slider_sens, 1, 1)
+        self.lbl_sens = QLabel("40")
+        self.lbl_sens.setFixedWidth(34)
+        self.lbl_sens.setStyleSheet(f"color:#D7E1EE; font-family:'{FONT_NUM}'; font-size:14px; font-weight:600;")
+        grid.addWidget(self.lbl_sens, 1, 2)
+
+        grid.addWidget(self._label("音量"), 2, 0)
+        self.slider_vol = QSlider(Qt.Horizontal)
+        self.slider_vol.setRange(0, 100)
+        self.slider_vol.valueChanged.connect(self._on_vol_changed)
+        self.slider_vol.sliderReleased.connect(self.save_settings_from_ui)
+        grid.addWidget(self.slider_vol, 2, 1)
+        self.lbl_vol = QLabel("100%")
+        self.lbl_vol.setFixedWidth(44)
+        self.lbl_vol.setStyleSheet(f"color:#D7E1EE; font-family:'{FONT_NUM}'; font-size:14px; font-weight:600;")
+        grid.addWidget(self.lbl_vol, 2, 2)
+
+        grid.setColumnStretch(1, 1)
+        set_card.content.addLayout(grid)
+        hint = QLabel("设置会写入 settings.json，下次启动游戏时生效")
+        hint.setObjectName("Hint")
+        set_card.content.addWidget(hint)
+        lay.addWidget(set_card)
+        lay.addStretch(1)
+        return self._wrap_page(page)
+
+    # ---------- 控制台页 ----------
+    def _build_console_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 8, 26, 6)
+        lay.setSpacing(12)
+
+        console_card = Card("控制台")
+        self.log_box = LogBox()
+        self.log_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        console_card.content.addWidget(self.log_box, 1)
+
+        cmd_row = QHBoxLayout()
+        cmd_row.setSpacing(8)
+        self.console_input = QLineEdit()
+        self.console_input.setPlaceholderText("输入命令，help 查看可用命令")
+        self.console_input.returnPressed.connect(self._run_local_command)
+        btn_run = QPushButton("执行")
+        btn_run.setObjectName("Ghost")
+        btn_run.setCursor(Qt.PointingHandCursor)
+        btn_run.clicked.connect(self._run_local_command)
+        cmd_row.addWidget(self.console_input, 1)
+        cmd_row.addWidget(btn_run)
+        console_card.content.addLayout(cmd_row)
+        lay.addWidget(console_card, 1)
+
+        quick = QHBoxLayout()
+        quick.setSpacing(8)
+        for text, handler in (
+            ("打开目录", self.open_game_dir),
+            ("查看日志", self.open_log_dir),
+            ("打开配置", self.open_settings_file),
+        ):
+            b = QPushButton(text)
+            b.setObjectName("Ghost")
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(handler)
+            quick.addWidget(b)
+        quick.addStretch(1)
+        lay.addLayout(quick)
+        return self._wrap_page(page)
+
+    def _run_local_command(self):
+        text = self.console_input.text().strip()
+        if not text:
+            return
+        self.console_input.clear()
+        self.log_box.append_line(f"> {text}")
+        cmd = text.partition(" ")[0].lower()
+        if cmd == "help":
+            self.log_box.append_line("可用命令：help　status（环境摘要）　clear（清空控制台）")
+        elif cmd == "status":
+            py = self.env.get("python_path") or self.cfg.get("last_good_python") or "未检测到"
+            self.log_box.append_line(f"环境：{'就绪' if self.env.get('ok') else '未就绪'}")
+            self.log_box.append_line(f"解释器：{py}")
+            self.log_box.append_line(f"游戏路径：{self.game_path}")
+        elif cmd == "clear":
+            self.log_box.clear()
+        else:
+            self.log_box.append_line(f"未知命令：{cmd}（输入 help 查看）")
+
+    # ---------- 我的页 ----------
+    def _build_profile_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 8, 26, 6)
+        lay.setSpacing(12)
+
+        # 账号卡
+        account_card = Card("账号")
+        acc_row = QHBoxLayout()
+        self.avatar = QLabel((self.nickname[:1] or "?").upper())
+        self.avatar.setFixedSize(46, 46)
+        self.avatar.setAlignment(Qt.AlignCenter)
+        self.avatar.setStyleSheet(
+            f"background:{C_ACCENT_DIM}; color:{C_TEXT}; border-radius:23px;"
+            f"font-size:18px; font-weight:700;"
+        )
+        acc_col = QVBoxLayout()
+        acc_col.setSpacing(2)
+        self.lbl_profile_nick = QLabel(self.nickname)
+        self.lbl_profile_nick.setStyleSheet(f"color:{C_TEXT}; font-size:15px; font-weight:600;")
+        cap = QLabel("游客登录 · 战绩保存在本机")
+        cap.setObjectName("Hint")
+        acc_col.addWidget(self.lbl_profile_nick)
+        acc_col.addWidget(cap)
+        acc_row.addWidget(self.avatar)
+        acc_row.addLayout(acc_col)
+        acc_row.addStretch(1)
+        self.btn_profile_switch = QPushButton("切换账号")
+        self.btn_profile_switch.setObjectName("Ghost")
+        self.btn_profile_switch.setCursor(Qt.PointingHandCursor)
+        self.btn_profile_switch.clicked.connect(self.switch_account)
+        acc_row.addWidget(self.btn_profile_switch)
+        account_card.content.addLayout(acc_row)
+        lay.addWidget(account_card)
+
+        # 战绩卡
+        score_card = Card("战绩")
+        score_row = QHBoxLayout()
+        score_row.setSpacing(6)
+        score_col = QVBoxLayout()
+        score_col.setSpacing(0)
+        self.lbl_best = QLabel("0")
+        self.lbl_best.setObjectName("BigScore")
+        score_col.addWidget(self.lbl_best)
+        cap2 = QLabel("历史最高分")
+        cap2.setObjectName("Hint")
+        score_col.addWidget(cap2)
+        score_row.addLayout(score_col)
+        score_row.addStretch(1)
+        info_col = QVBoxLayout()
+        info_col.setSpacing(2)
+        self.lbl_last = QLabel("最近一局  —")
+        self.lbl_last.setStyleSheet(f"color:{C_TEXT}; font-size:12px;")
+        self.lbl_when = QLabel("—")
+        self.lbl_when.setObjectName("Hint")
+        info_col.addWidget(self.lbl_last)
+        info_col.addWidget(self.lbl_when)
+        info_col.addStretch(1)
+        score_row.addLayout(info_col)
+        score_card.content.addLayout(score_row)
+        lay.addWidget(score_card)
+
+        # 客户端卡
+        about_card = Card("客户端")
+        ver_row = QHBoxLayout()
+        ver_row.addWidget(self._label(f"版本 {APP_VERSION}"))
+        ver_row.addStretch(1)
+        self.btn_update = QPushButton("检查更新")
+        self.btn_update.setObjectName("Ghost")
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.clicked.connect(self.check_update)
+        ver_row.addWidget(self.btn_update)
+        about_card.content.addLayout(ver_row)
+        lay.addWidget(about_card)
+        lay.addStretch(1)
+        return self._wrap_page(page)
+
+
     @staticmethod
     def _label(text):
         lbl = QLabel(text)
@@ -1025,10 +1166,37 @@ class LauncherWindow(QWidget):
         rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         path = QPainterPath()
         path.addRoundedRect(rect, 16, 16)
+
         grad = QLinearGradient(0, 0, self.width(), self.height())
-        grad.setColorAt(0, QColor(C_BG))
-        grad.setColorAt(1, QColor("#080B10"))
+        grad.setColorAt(0, QColor("#0C1017"))
+        grad.setColorAt(0.55, QColor("#0A0D13"))
+        grad.setColorAt(1, QColor("#0B0F16"))
         p.fillPath(path, grad)
+
+        p.save()
+        p.setClipPath(path)
+
+        def _glow(cx, cy, r, rgb, a0):
+            c = QColor(rgb[0], rgb[1], rgb[2])
+            g = QRadialGradient(cx, cy, r)
+            g.setColorAt(0, QColor(c.red(), c.green(), c.blue(), a0))
+            g.setColorAt(1, QColor(c.red(), c.green(), c.blue(), 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(g)
+            p.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+
+        _glow(-80, -80, 300, (64, 92, 168), 86)
+        _glow(self.width() + 70, self.height() + 70, 280, (31, 110, 128), 76)
+        _glow(self.width() - 170, 120, 240, (255, 107, 53), 40)
+
+        p.setPen(QPen(QColor(255, 255, 255, 7), 1))
+        step = 30
+        for x in range(0, self.width(), step):
+            p.drawLine(x, 0, x, self.height())
+        for y in range(0, self.height(), step):
+            p.drawLine(0, y, self.width(), y)
+        p.restore()
+
         p.setPen(QPen(QColor("#232E3E"), 1))
         p.drawPath(path)
 
@@ -1120,6 +1288,7 @@ class LauncherWindow(QWidget):
             self.btn_launch.setEnabled(False)
             self.btn_repair.setVisible(True)
             detail = info.get("detail") or []
+            self._switch_page("console")
             self.log_box.setVisible(True)
             self.log_box.clear()
             self.log_box.append_line("【环境检测失败】")
@@ -1135,6 +1304,7 @@ class LauncherWindow(QWidget):
             QMessageBox.warning(self, "无法修复", "没有找到可用的 Python 安装，请先安装 Python 3.11/3.12。")
             return
         base = usable[0]
+        self._switch_page("console")
         self.log_box.setVisible(True)
         self.log_box.append_line(f"【开始修复环境】基础解释器：{base}")
         self.lbl_status.setText("正在修复运行环境…")
@@ -1299,6 +1469,10 @@ class LauncherWindow(QWidget):
             self.cfg["nickname"] = dlg.nickname
             save_config(self.cfg)
             self.lbl_nick.setText(f"●  {self.nickname}")
+            if hasattr(self, "lbl_profile_nick"):
+                self.lbl_profile_nick.setText(self.nickname)
+            if hasattr(self, "avatar"):
+                self.avatar.setText((self.nickname[:1] or "?").upper())
             self.flash_status(f"已切换为 {self.nickname}")
 
     def launch_online_game(self, extra_args, tag, on_finished):
@@ -1317,6 +1491,7 @@ class LauncherWindow(QWidget):
         self._game_finished_cb = on_finished
         self._game_tag = tag
 
+        self._switch_page("console")
         self.log_box.setVisible(True)
         self.log_box.clear()
         self.log_box.append_line(f"$ {python} \"{self.game_path.name}\" {' '.join(extra_args or [])}")
@@ -1475,9 +1650,6 @@ class LauncherWindow(QWidget):
             os.startfile(str(path))  # noqa: S606
         except (OSError, AttributeError):
             pass
-
-    def toggle_log(self):
-        self.log_box.setVisible(not self.log_box.isVisible())
 
     # ---------- 更新 ----------
     def check_update(self):

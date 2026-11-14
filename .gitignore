@@ -33,3 +33,8 @@ Thumbs.db
 
 # ---- 本地产物与代理工作数据 ----
 .workbuddy/
+
+# ---- 临时下载 / 探针文件 ----
+_ffs.7z
+_rl_*.wav
+_dl_*.log

@@ -60,16 +60,18 @@ class Crosshair:
                               scale=(self.thickness, self.thickness),
                               color=rgba(col, 255), z=-0.011)
 
-        # 命中标记
+        # 命中标记（平时完全隐藏，仅命中瞬间红色闪现）
         self.marks = []
+        self.mark_outlines = []
         for sx, sy in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
-            Entity(parent=self.root, model='quad', scale=(px(11), px(1.8)),
-                   position=(sx * px(9), sy * px(9), -0.012), rotation_z=-45 * sx * sy,
-                   color=rgba((0, 0, 0), 120))
+            outline = Entity(parent=self.root, model='quad', scale=(px(11), px(1.8)),
+                             position=(sx * px(9), sy * px(9), -0.012),
+                             rotation_z=-45 * sx * sy, color=rgba((0, 0, 0), 0))
             e = Entity(parent=self.root, model='quad', scale=(px(10), px(1.4)),
                        position=(sx * px(9), sy * px(9), -0.013), rotation_z=-45 * sx * sy,
-                       color=rgba((255, 255, 255), 0))
+                       color=rgba((255, 92, 72), 0))
             self.marks.append(e)
+            self.mark_outlines.append(outline)
         self.mark_t = 0.0
         self.mark_kill = False
 
@@ -97,15 +99,25 @@ class Crosshair:
                         e.y = 0
                         e.x = sign * (gap + ln / 2)
 
-    def fire(self):
-        self.spread = min(px(16), self.spread + px(5.5))
+    def fire(self, power=None, cap=None):
+        """开火扩散。power/cap 是 900p 像素值；None 用手枪默认值。
+
+        由调用方按武器散布角换算传入：散布越大准星张得越开，
+        玩家能直观读到"这把枪现在打不准"。
+        """
+        power = px(5.5) if power is None else power
+        cap = px(16) if cap is None else cap
+        self.spread = min(cap, self.spread + power)
 
     def hit(self, kill=False):
-        self.mark_t = 0.32 if kill else 0.16
+        """命中瞬间：红色标记短暂闪现（击杀更大更久），平时不可见。"""
+        self.mark_t = 0.30 if kill else 0.16
         self.mark_kill = kill
         for m in self.marks:
             m.scale = (px(15) if kill else px(10), px(2.0) if kill else px(1.4))
-            m.color = rgba((255, 92, 72) if kill else (255, 255, 255), 255)
+            m.color = rgba((255, 92, 72), 255)
+        for o in self.mark_outlines:
+            o.color = rgba((0, 0, 0), 150)
 
     def damage(self, angle_deg):
         self.dmg_t = 1.1
@@ -117,18 +129,72 @@ class Crosshair:
 
         if self.mark_t > 0:
             self.mark_t = max(0.0, self.mark_t - dt)
-            k = min(1.0, self.mark_t / (0.16 if not self.mark_kill else 0.32))
+            k = min(1.0, self.mark_t / (0.30 if self.mark_kill else 0.16))
             for m in self.marks:
-                m.color = rgba((255, 92, 72) if self.mark_kill else (255, 255, 255), 255 * k)
+                m.color = rgba((255, 92, 72), 255 * k)
+            for o in self.mark_outlines:
+                o.color = rgba((0, 0, 0), 150 * k)
         else:
+            # 平时完全隐藏：不残留任何描边或红标
             for m in self.marks:
-                m.color = rgba((255, 255, 255), 0)
+                m.color = rgba((255, 92, 72), 0)
+            for o in self.mark_outlines:
+                o.color = rgba((0, 0, 0), 0)
 
         if self.dmg_t > 0:
             self.dmg_t = max(0.0, self.dmg_t - dt)
             self.dmg_dir.color = rgba((255, 255, 255), 210 * min(1.0, self.dmg_t / 0.55))
         else:
             self.dmg_dir.color = rgba((255, 255, 255), 0)
+
+
+class Scope:
+    """狙击镜遮罩：按当前宽高比拼四块黑边 + 圆环 + 十字线。
+
+    圆半径用"屏高单位"（r=0.44），四块黑边用 ui_half_w() 补到屏幕边缘，
+    任何宽高比（16:9 / 21:9 / 竖屏）都不会穿帮。
+    """
+
+    def __init__(self, parent):
+        self.root = Entity(parent=parent, enabled=False, name='scope')
+        self.r = 0.44
+        self.blocks = [Entity(parent=self.root, model='quad',
+                              color=rgba((2, 3, 6), 255), z=-0.008)
+                       for _ in range(4)]
+        # 圆形遮罩：黑底 + 透明圆孔（正方形 quad，像素级正圆），补齐
+        # 四块黑边盖不住的"内接圆四角"区域
+        self.mask = Entity(parent=self.root, model='quad', texture=TEX['scope_mask'],
+                           scale=(self.r * 2, self.r * 2), z=-0.0085)
+        self.ring = Entity(parent=self.root, model='quad', texture=TEX['ring'],
+                           scale=(self.r * 2, self.r * 2), z=-0.009,
+                           color=rgba((168, 186, 204), 235))
+        # 十字线 + 中心点
+        Entity(parent=self.root, model='quad', scale=(self.r * 2, px(1.7)),
+               z=-0.010, color=rgba((12, 14, 18), 255))
+        Entity(parent=self.root, model='quad', scale=(px(1.7), self.r * 2),
+               z=-0.010, color=rgba((12, 14, 18), 255))
+        Entity(parent=self.root, model='quad', scale=(px(3.4), px(3.4)),
+               z=-0.011, color=rgba(T.C_DANGER, 255))
+        self.relayout()
+
+    def relayout(self):
+        half = ui_half_w() + 0.02
+        r = self.r
+        ov = 0.03                       # 与圆重叠，避免黑边与圆环之间露缝
+        top, bottom, left, right = self.blocks
+        vh = max(0.01, 0.5 - r + ov)
+        top.scale = (half * 2, vh)
+        top.position = (0, 0.5 - vh / 2)
+        bottom.scale = (half * 2, vh)
+        bottom.position = (0, -0.5 + vh / 2)
+        hw = max(0.01, half - r + ov)
+        left.scale = (hw, 1.0)
+        left.position = (-half + hw / 2, 0)
+        right.scale = (hw, 1.0)
+        right.position = (half - hw / 2, 0)
+
+    def set_visible(self, on):
+        self.root.enabled = bool(on)
 
 
 class KillFeed:
@@ -262,6 +328,8 @@ class HUD:
         self._build_death()
         self._build_room()
         self.crosshair = Crosshair(self.root)
+        self.scope = Scope(self.root)
+        self._melee = False
         self._build_banner()
 
         self._cache = {}
@@ -303,14 +371,20 @@ class HUD:
         self.weapon_name = p.text(T.spaced(self.weapon.name), 13,
                                   x=px(AMMO_W) / 2 - px(16), y=px(33), origin=(0.5, 0),
                                   col=T.C_TEXT_DIM, alpha=225)
-        p.image(TEX['ic_bullet'], px(24), px(24), x=-px(AMMO_W) / 2 + px(26), y=-px(6),
-                col=T.C_TEXT_DIM, alpha=215)
+        self.bullet_icon = p.image(TEX['ic_bullet'], px(24), px(24),
+                                   x=-px(AMMO_W) / 2 + px(26), y=-px(6),
+                                   col=T.C_TEXT_DIM, alpha=215)
         self.mag_text = p.text(str(self.weapon.mag_size), 42,
                                x=px(AMMO_W) / 2 - px(108), y=-px(7), origin=(0.5, 0),
                                style='num', col=T.C_TEXT)
         self.res_text = p.text(f'/  {self.weapon.reserve}', 18,
                                x=px(AMMO_W) / 2 - px(20), y=-px(4), origin=(0.5, 0),
-                               col=T.C_TEXT_MUTE, style='num')
+                               col=T.C_TEXT_MUTE, style='num',
+                               font=T.FONT_CJK)   # ∞ / — 需要含该字形的字体（Rajdhani 缺字）
+        # 近战武器：不显示弹药，改成一行提示
+        self.melee_label = p.text('近战武器', 19, x=-px(AMMO_W) / 2 + px(28), y=-px(8),
+                                  origin=(-0.5, 0), col=T.C_ACCENT, alpha=240)
+        self.melee_label.enabled = False
         # 换弹进度条
         self.reload_bg = Entity(parent=p, model='quad', scale=(px(AMMO_W) - px(32), px(3)),
                                 position=(0, -px(AMMO_H) / 2 + px(9), -0.004),
@@ -346,24 +420,42 @@ class HUD:
 
     def _build_hints(self):
         self.hints = Entity(parent=self.root)
-        pairs = [('WASD', '移动'), ('SPACE', '跳跃'), ('R', '换弹'), ('TAB', '计分板'),
-                 ('ESC', '菜单')]
-        x = 0.0
+        pairs = [('WASD', '移动'), ('SPACE', '跳跃'), ('MOUSE1', '射击'), ('R', '换弹'),
+                 ('F', '检视'), ('MOUSE2', '开镜'), ('1-3', '切枪'), ('B', '商店'),
+                 ('TAB', '计分板'), ('ESC', '菜单')]
         gap_key = px(9)
-        gap_item = px(30)
-        # 先测量每项宽度，再整体居中
-        widths = []
+        gap_item = px(26)
+        # 先建出来再用实际宽度排版：文字宽度估算不准会让整排偏到左边
+        items = []
         for key, txt in pairs:
-            kw = max(px(20) * 1.02, px(20) * (0.60 * len(key) + 0.46))
-            widths.append(kw + gap_key + px(TEXT_W(txt)) + gap_item)
-        total = sum(widths) - gap_item
-        x = -total / 2
-        for (key, txt), wdt in zip(pairs, widths):
-            kw = max(px(20) * 1.02, px(20) * (0.60 * len(key) + 0.46))
-            KeyCap(self.hints, key, x=x + kw / 2, y=0, h_px=20, size_px=12)
-            label(self.hints, txt, 13, x=x + kw + gap_key, y=0, col=T.C_TEXT_DIM)
-            x += wdt
-        self._hints_y = -0.5 + px(26)
+            cap = KeyCap(self.hints, key, x=0, y=0, h_px=20, size_px=12)
+            lab = label(self.hints, txt, 13, x=0, y=0, col=T.C_TEXT_DIM)
+            items.append((key, cap, lab))
+        self._hint_items = items
+        self._hint_gap_key = gap_key
+        self._hint_gap_item = gap_item
+        self._layout_hints()
+
+    def _layout_hints(self):
+        """按键提示排版；窄屏（竖屏手机）只留核心几项防溢出。"""
+        narrow = window.aspect_ratio < 1.2
+        keep = {'MOUSE1', 'R', 'MOUSE2', '1-3', 'B', 'TAB'} if narrow else None
+        gap_key, gap_item = self._hint_gap_key, self._hint_gap_item
+        x = 0.0
+        first_x = None
+        for key, cap, lab in self._hint_items:
+            show = (key in keep) if narrow else True
+            cap.enabled = lab.enabled = show
+            if not show:
+                continue
+            if first_x is None:
+                first_x = x
+            cap.x = x + cap.w / 2
+            lab.x = x + cap.w + gap_key
+            x += cap.w + gap_key + lab.width + gap_item
+        total = x - gap_item if x > 0 else 0
+        self.hints.x = -total / 2
+        self._hints_y = -0.5 + px(32)
 
     def _build_death(self):
         self.death_root = Entity(parent=self.root, enabled=False)
@@ -398,16 +490,21 @@ class HUD:
         self.ammo.x = half - px(PAD) - px(AMMO_W) / 2
         self.ammo.y = -0.5 + px(PAD) + px(AMMO_H) / 2
 
-        self.score_panel.x = 0
-        self.score_panel.y = 0.5 - px(PAD) - px(SCORE_H) / 2
-
+        # 窄屏（竖屏手机）：顶部比分/击杀提示下移到雷达下方，避免重叠
         self.radar.root.x = -half + px(PAD) + self.radar.size / 2
         self.radar.root.y = 0.5 - px(PAD) - self.radar.size / 2
-
         self.killfeed.root.x = half - px(PAD) - px(250) / 2 - px(4)
-        self.killfeed.root.y = 0.5 - px(PAD) - px(13)
+        narrow = window.aspect_ratio < 1.2
+        if narrow:
+            top_y = 0.5 - px(PAD) - self.radar.size - px(10)
+            self.score_panel.y = top_y - px(SCORE_H) / 2
+            self.killfeed.root.y = top_y - px(13)
+        else:
+            self.score_panel.y = 0.5 - px(PAD) - px(SCORE_H) / 2
+            self.killfeed.root.y = 0.5 - px(PAD) - px(13)
 
         self.hints.y = self._hints_y
+        self._layout_hints()
 
         if self.room_label.enabled:
             self.room_label.x = -half + px(PAD) + px(4)
@@ -417,6 +514,7 @@ class HUD:
         self.banner_root.y = 0.5 - px(PAD) - px(SCORE_H) - px(70)
         self.death_dark.scale = (window.aspect_ratio + 0.4, 1.4)
         self.vignette.scale = (window.aspect_ratio * 1.04, 1.06)
+        self.scope.relayout()
 
     def set_room_info(self, text):
         self.room_label.text = text
@@ -424,6 +522,26 @@ class HUD:
         self.room_label.x = -ui_half_w() + px(PAD) + px(4)
         self.room_label.y = self.radar.root.y - self.radar.size / 2 - px(12)
         self.room_label.origin = (-0.5, 0)
+
+    def set_weapon(self, weapon, kind='gun'):
+        """切换到另一把武器（枪 / 近战），同步右下角弹药面板与准星。"""
+        self.weapon = weapon
+        self.weapon_name.text = T.spaced(weapon.name)
+        melee = kind == 'melee'
+        self._melee = melee
+        for e in (self.mag_text, self.res_text, self.bullet_icon):
+            e.enabled = not melee
+        self.melee_label.enabled = melee
+        self.weapon_name.color = rgba(T.C_ACCENT if melee else T.C_TEXT_DIM, 225)
+        self.crosshair.root.enabled = not melee and not self.scope.root.enabled
+        self.crosshair.spread = 0.0        # 切枪重置扩散
+        if melee:
+            self.reload_bg.enabled = self.reload_fill.enabled = False
+
+    def set_scoping(self, on):
+        """开镜（AWM）：显示镜片遮罩并隐藏普通准星。"""
+        self.scope.set_visible(on)
+        self.crosshair.root.enabled = (not on) and (not self._melee)
 
     def banner(self, text, seconds=1.4, col=None):
         self.banner_text.text = text
@@ -440,10 +558,11 @@ class HUD:
     def on_damage(self, angle_deg=0.0):
         self.crosshair.damage(angle_deg)
 
-    def push_kill(self, victim, gain=10, weapon=''):
-        txt = f'你  »  {victim}'
+    def push_kill(self, victim, gain=10, weapon='', killer='你'):
+        txt = f'{killer}  »  {victim}'
         self.killfeed.push(txt, tag=f'+{gain}' if gain else '', accent=T.C_ACCENT)
-        self.banner(f'击杀 {victim}', seconds=0.9, col=T.C_TEXT)
+        if killer == '你':
+            self.banner(f'击杀 {victim}', seconds=0.9, col=T.C_TEXT)
 
     # ------------------------------------------------------------ 每帧
     def update(self, dt, body, targets=()):
@@ -467,7 +586,7 @@ class HUD:
 
         # 弹药
         self._set(self.mag_text, str(w.mag))
-        self._set(self.res_text, f'/  {w.reserve}')
+        self._set(self.res_text, f'/  {w.reserve_text}')
         self.mag_text.color = rgba(T.C_DANGER if w.mag == 0 else T.C_TEXT, 250)
 
         if w.reloading:

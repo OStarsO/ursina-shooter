@@ -4,7 +4,8 @@ import sys
 
 sys.path.insert(0, '.')
 
-from combat import Player, Weapon
+from combat import (Player, Weapon, Melee, ZONE_MULTIPLIERS, zone_damage,
+                    classify_zone_by_height)
 
 PASS, FAIL = [], []
 
@@ -100,9 +101,40 @@ def test_player():
     check('显示数值取整', p.health_text == '80' and p.armor_text == '34')
 
 
+def test_zone_damage():
+    """分部位伤害（三区简化：头×4 / 身×1.25 / 肢×0.75）。"""
+    check('倍率表三区', set(ZONE_MULTIPLIERS) == {'head', 'body', 'limb'})
+    check('头部倍率 ×4', ZONE_MULTIPLIERS['head'] == 4.0)
+    check('躯干倍率 ×1.25', ZONE_MULTIPLIERS['body'] == 1.25)
+    check('肢体倍率 ×0.75', ZONE_MULTIPLIERS['limb'] == 0.75)
+    check('USP 爆头 136', zone_damage(34, 'head') == 136.0)
+    check('USP 躯干 42.5', zone_damage(34, 'body') == 42.5)
+    check('USP 肢体 25.5', zone_damage(34, 'limb') == 25.5)
+    check('AK 爆头 144', zone_damage(36, 'head') == 144.0)
+    check('AWM 躯干 143.75', abs(zone_damage(115, 'body') - 143.75) < 1e-9)
+    check('未知部位按躯干', zone_damage(34, 'toe') == 42.5)
+    # 高度划分（1.8 米站姿：≥1.55 头 / ≥0.75 躯干 / 其下肢体）
+    check('高度 1.6 = 头', classify_zone_by_height(1.6) == 'head')
+    check('高度 1.55 = 头（边界含）', classify_zone_by_height(1.55) == 'head')
+    check('高度 1.0 = 躯干', classify_zone_by_height(1.0) == 'body')
+    check('高度 0.74 = 肢体（边界下）', classify_zone_by_height(0.74) == 'limb')
+    check('高度 0.0 = 肢体', classify_zone_by_height(0.0) == 'limb')
+
+
+def test_melee_interface():
+    """近战与 Weapon 的 HUD 兼容接口（reserve_text 等）。"""
+    m = Melee('刺刀', damage=55, rpm=110, reach=2.6)
+    check('近战永不空仓', m.empty is False)
+    check('近战无备弹占位符', m.reserve_text == '—')
+    check('近战换弹进度恒满', m.reload_progress == 1.0)
+    check('近战换弹被拒绝', m.start_reload() is False)
+
+
 def main():
     test_weapon()
     test_player()
+    test_zone_damage()
+    test_melee_interface()
     print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
     if FAIL:
         print('失败项:', FAIL)

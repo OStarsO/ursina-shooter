@@ -1061,7 +1061,9 @@ class MemberRow(QWidget):
         if member.get("is_host"):
             tags.append(("房主", C_ACCENT))
         if member.get("is_bot"):
-            tags.append(("BOT", C_MUTED))
+            diff_cn = {"easy": "简单", "normal": "普通", "hard": "困难"}.get(
+                member.get("difficulty"), "")
+            tags.append((f"BOT·{diff_cn}" if diff_cn else "BOT", C_MUTED))
         if member.get("in_game"):
             tags.append(("对战中", C_OK))
         for text, col in tags:
@@ -1223,6 +1225,26 @@ class RoomLobbyWindow(FramelessMixin, QWidget):
             self.btn_console.setCursor(Qt.PointingHandCursor)
             self.btn_console.clicked.connect(self._toggle_console)
             act_card.content.addWidget(self.btn_console)
+
+            # ---- 人机补齐：难度 + 补齐/清空（房间不满员时用 BOT 填满）----
+            bot_row = QHBoxLayout()
+            bot_row.setSpacing(6)
+            self.cmb_bot_diff = QComboBox()
+            self.cmb_bot_diff.addItems(["普通", "简单", "困难"])
+            self.cmb_bot_diff.setToolTip("人机难度：影响命中率、反应与伤害倍率")
+            bot_row.addWidget(self.cmb_bot_diff, 1)
+            self.btn_fill_bots = QPushButton("人机补齐")
+            self.btn_fill_bots.setObjectName("Ghost")
+            self.btn_fill_bots.setCursor(Qt.PointingHandCursor)
+            self.btn_fill_bots.setToolTip("按所选难度为人机填满两队剩余空位")
+            self.btn_fill_bots.clicked.connect(self._fill_bots)
+            bot_row.addWidget(self.btn_fill_bots, 1)
+            self.btn_clear_bots = QPushButton("清空人机")
+            self.btn_clear_bots.setObjectName("Ghost")
+            self.btn_clear_bots.setCursor(Qt.PointingHandCursor)
+            self.btn_clear_bots.clicked.connect(self._clear_bots)
+            bot_row.addWidget(self.btn_clear_bots, 1)
+            act_card.content.addLayout(bot_row)
             act_card.content.addStretch(1)
         else:
             self.lbl_wait = QLabel("等待房主开始游戏…")
@@ -1485,6 +1507,38 @@ class RoomLobbyWindow(FramelessMixin, QWidget):
             self.console_input.setFocus()
             if not self.console_box.toPlainText():
                 self._log_console("[系统] 控制台就绪，输入 help 查看命令")
+
+    # ---------- 人机补齐 ----------
+
+    def _fill_bots(self):
+        """按所选难度为两队补齐人机（每队补到 team_size 满员）。"""
+        if not self.server:
+            return
+        diff = {0: "normal", 1: "easy", 2: "hard"}[self.cmb_bot_diff.currentIndex()]
+        diff_cn = {"normal": "普通", "easy": "简单", "hard": "困难"}[diff]
+        team_size = self.server.room.get("team_size", 1)
+        members = self.server.member_list()
+        red_hum = sum(1 for m in members if not m["is_bot"] and m["team"] == "red")
+        blue_hum = sum(1 for m in members if not m["is_bot"] and m["team"] == "blue")
+        need_red = max(0, team_size - red_hum)
+        need_blue = max(0, team_size - blue_hum)
+        added = self.server.add_bots("red", need_red, diff) + \
+            self.server.add_bots("blue", need_blue, diff)
+        if added:
+            self._log_console(
+                f"[系统] 人机补齐：红队 +{need_red} / 蓝队 +{need_blue}（难度：{diff_cn}）")
+        else:
+            self._log_console("[系统] 房间已满员，无人机可补")
+        self._refresh_members()
+        self._refresh_room()
+
+    def _clear_bots(self):
+        if not self.server:
+            return
+        self.server.clear_bots()
+        self._log_console("[系统] 已清空全部人机")
+        self._refresh_members()
+        self._refresh_room()
 
     def _run_command(self):
         text = self.console_input.text().strip()

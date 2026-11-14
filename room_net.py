@@ -14,6 +14,10 @@
     {"t":"hello","nickname","password"} 加入房间
     {"t":"leave"}                       主动离开
     {"t":"game_hello","token"}          游戏进程接入（下一轮联机逻辑使用）
+    {"t":"hit_claim","attacker","target","weapon","zone"}
+                                        命中声明（游戏内上报，服务器按
+                                        anticheat 规则验证后才计入比分）
+    {"t":"respawn_done"}                本机玩家/人机重生完成
   服务端 → 客户端
     {"t":"info","room":{...}}           房间公开信息（响应 query）
     {"t":"welcome","room","you","members"} / {"t":"reject","reason"}
@@ -21,6 +25,8 @@
     {"t":"room_update","room":{...}}    房间设置变更（密码/锁定/时长等）
     {"t":"console","text"}              控制台广播（含作弊命令提示，始终全员可见）
     {"t":"cmd_apply","cmd":{...}}       命令下发（游戏进程下一轮接入后生效）
+    {"t":"score_update","stats":{...}}  权威比分（服务器验证后的战绩）
+    {"t":"claim_reject","reason"}       被拒绝的命中声明（回执给上报方）
     {"t":"start","game":{...}}          开始对局
     {"t":"lobby","reason"}              对局结束回到大厅
     {"t":"kicked","reason"} / {"t":"closed","reason"}
@@ -36,6 +42,8 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+import anticheat as AC
 
 ROOM_PORT = 25250
 PROTO_VERSION = 1
@@ -199,6 +207,7 @@ class RoomService:
         self._running = False
         self._listen_thread = None
         self.host_member = self._add_member(nickname, "red", host=True, addr="127.0.0.1")
+        self.anticheat = AC.AntiCheat()      # 服务器端命中验证（对局期使用）
 
     # ---------- 生命周期 ----------
 
@@ -357,8 +366,22 @@ class RoomService:
             return
         self.broadcast({"t": "members", "members": self.member_list()})
         try:
-            for _raw in reader:  # 游戏进程消息，下一轮接入联机逻辑
-                pass
+            for raw in reader:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                kind = data.get("t")
+                if kind == "hit_claim":
+                    self._handle_hit_claim(member, data)
+                elif kind == "respawn_done":
+                    now = time.time()
+                    self.anticheat.respawn_done(member["id"], now)
+                elif kind == "leave":
+                    break
         except (OSError, ValueError):
             pass
         with self._lock:
@@ -410,7 +433,10 @@ class RoomService:
 
     @staticmethod
     def _member_public(member):
-        return {k: member[k] for k in ("id", "nickname", "team", "is_host", "is_bot", "in_game")}
+        pub = {k: member[k] for k in ("id", "nickname", "team", "is_host", "is_bot", "in_game")}
+        if member.get("is_bot") and member.get("difficulty"):
+            pub["difficulty"] = member["difficulty"]
+        return pub
 
     def member_list(self):
         with self._lock:
@@ -451,6 +477,8 @@ class RoomService:
             if len(humans) < 2:
                 return None, f"至少需要 2 名玩家（当前 {len(humans)} 人）"
             self.room["state"] = "playing"
+            # 服务器端验证器：以全体成员（含人机）初始化血量与战绩
+            self.anticheat.begin_round(list(self.members.keys()))
             game = {
                 "mode": self.room["mode"],
                 "mode_label": self.room["mode_label"],
@@ -478,6 +506,59 @@ class RoomService:
         self.broadcast({"t": "lobby", "reason": reason})
         self.events.put(("game_ended", reason))
         return True
+
+    # ============================ 命中声明验证 ============================
+
+    def _handle_hit_claim(self, reporter, data):
+        """游戏进程上报一条命中 → 服务器按 anticheat 规则验证 → 广播权威比分。
+
+        reporter:       发消息连接对应的成员（玩家本人，或房主代报人机）
+        data.attacker:  实际造成伤害的成员 id（人机由房主连接代报）
+        data.target / data.weapon / data.zone
+        """
+        now = time.time()
+        try:
+            attacker = int(data.get("attacker", reporter["id"]))
+            target = int(data.get("target", 0))
+            weapon = str(data.get("weapon", ""))
+            zone = str(data.get("zone", ""))
+        except (TypeError, ValueError):
+            return
+        # 身份约束：
+        #   - 玩家只能以自己的身份上报（attacker == reporter）；
+        #   - 人机（bot 无连接）的声明由房主连接代报，或由"被打的那个人"
+        #     上报自己受到的人机伤害（target == reporter）。
+        if attacker != reporter["id"]:
+            bot = self.members.get(attacker)
+            if bot is None or not bot.get("is_bot"):
+                self._send_claim_reject(reporter["id"], AC.RejectReason.IDENTITY)
+                return
+            if not (reporter.get("is_host") or target == reporter["id"]):
+                self._send_claim_reject(reporter["id"], AC.RejectReason.IDENTITY)
+                return
+
+        accepted, reason, damage, kill = self.anticheat.claim(
+            attacker, target, weapon, zone, now, reporter_id=reporter["id"])
+        if not accepted:
+            self._send_claim_reject(reporter["id"], reason)
+            return
+        # 权威比分广播给所有游戏进程 + 大厅
+        self.broadcast({
+            "t": "score_update",
+            "stats": self.anticheat.stats_public(),
+            "kill": kill,
+            "attacker": attacker,
+            "target": target,
+            "damage": round(damage, 1),
+        }, to_game=True)
+
+    def _send_claim_reject(self, member_id, reason):
+        conn = self._game_conns.get(member_id) or self._conns.get(member_id)
+        if conn is not None:
+            try:
+                send_msg(conn, {"t": "claim_reject", "reason": reason})
+            except OSError:
+                pass
 
     # ---------- 房间设置（供 UI 直接调用） ----------
 
@@ -541,7 +622,7 @@ class RoomService:
         return True, (
             "命令列表：score set/add/reset · time <秒> · end · restart · "
             "god/speed/damage/ammo/kill/tp/respawn <玩家|all> [参数] · "
-            "bot add <红|蓝> <n> / bot clear · kick/ban <玩家> · "
+            "bot add <红|蓝> <n> [简单/普通/困难] / bot clear · kick/ban <玩家> · "
             "lock on|off · pwd <新密码|off> · say <消息> · status"
         )
 
@@ -743,15 +824,42 @@ class RoomService:
 
     # ---- 机器人 ----
 
+    def add_bots(self, team, count, difficulty="normal"):
+        """UI 直接调用：为指定队伍添加 n 个指定难度的人机。"""
+        if difficulty not in ("easy", "normal", "hard"):
+            difficulty = "normal"
+        with self._lock:
+            used = sum(1 for m in self.members.values() if m["is_bot"])
+            capacity = self.room["max_players"] - self._human_count() - used
+            count = min(max(0, count), max(0, capacity))
+            for i in range(count):
+                bot_id = 900000 + len(self.members)
+                self.members[bot_id] = {
+                    "id": bot_id,
+                    "nickname": f"BOT-{team.upper()[:1]}{i + 1 + used}",
+                    "team": team,
+                    "is_host": False,
+                    "is_bot": True,
+                    "in_game": False,
+                    "addr": "",
+                    "token": "",
+                    "difficulty": difficulty,
+                }
+        self.broadcast({"t": "members", "members": self.member_list()})
+        return count
+
+    def clear_bots(self):
+        with self._lock:
+            for mid in [i for i, m in self.members.items() if m["is_bot"]]:
+                del self.members[mid]
+        self.broadcast({"t": "members", "members": self.member_list()})
+
     def _cmd_bot(self, cmd, args):
         if not args:
-            return False, "用法：bot add <红|蓝> <n> | bot clear"
+            return False, "用法：bot add <红|蓝> <n> [简单|普通|困难] | bot clear"
         sub = args[0].lower()
         if sub == "clear":
-            with self._lock:
-                for mid in [i for i, m in self.members.items() if m["is_bot"]]:
-                    del self.members[mid]
-            self.broadcast({"t": "members", "members": self.member_list()})
+            self.clear_bots()
             return True, "机器人已清空"
         if sub == "add" and len(args) >= 3:
             team = "red" if args[1] in ("红", "red") else "blue" if args[1] in ("蓝", "blue") else None
@@ -761,27 +869,17 @@ class RoomService:
                 count = max(1, min(20, int(args[2])))
             except ValueError:
                 return False, "数量必须是整数"
-            with self._lock:
-                used = sum(1 for m in self.members.values() if m["is_bot"])
-                capacity = self.room["max_players"] - self._human_count() - used
-                count = min(count, max(0, capacity))
-                for i in range(count):
-                    bot_id = 900000 + len(self.members)
-                    self.members[bot_id] = {
-                        "id": bot_id,
-                        "nickname": f"BOT-{team.upper()[:1]}{i + 1 + used}",
-                        "team": team,
-                        "is_host": False,
-                        "is_bot": True,
-                        "in_game": False,
-                        "addr": "",
-                        "token": "",
-                    }
-            if count <= 0:
+            difficulty = "normal"
+            if len(args) >= 4:
+                diff_map = {"简单": "easy", "普通": "normal", "困难": "hard",
+                            "easy": "easy", "normal": "normal", "hard": "hard"}
+                difficulty = diff_map.get(args[3].lower(), "normal")
+            added = self.add_bots(team, count, difficulty)
+            if added <= 0:
                 return False, "房间已满，无法再添加机器人"
-            self.broadcast({"t": "members", "members": self.member_list()})
-            return True, f"已为 {'红' if team == 'red' else '蓝'}队 添加 {count} 个机器人"
-        return False, "用法：bot add <红|蓝> <n> | bot clear"
+            label = {"easy": "简单", "normal": "普通", "hard": "困难"}[difficulty]
+            return True, f"已为 {'红' if team == 'red' else '蓝'}队 添加 {added} 个机器人（难度：{label}）"
+        return False, "用法：bot add <红|蓝> <n> [简单|普通|困难] | bot clear"
 
     # ---- 房间管理 ----
 

@@ -4,14 +4,14 @@
 launcher.py 与 net_ui.py 共同引用，避免相互导入形成环。
 """
 
-# 配色（战术风深色）
-C_BG = "#0A0D12"
-C_PANEL = "#111722"
-C_PANEL_2 = "#0D131C"
-C_BORDER = "#1E2836"
-C_TEXT = "#E7EEF9"
-C_MUTED = "#7E8DA4"
-C_ACCENT = "#FF6B35"
+# 配色（深色毛玻璃风）
+C_BG = "#0A0D13"
+C_PANEL = "#151C28"
+C_PANEL_2 = "#0E141D"
+C_BORDER = "#2A3546"
+C_TEXT = "#EDF2FA"
+C_MUTED = "#96A6BE"
+C_ACCENT = "#FF7A45"
 C_ACCENT_DIM = "#8C3A1D"
 C_OK = "#3DDC97"
 C_WARN = "#F5B544"

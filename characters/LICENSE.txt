@@ -1,0 +1,27 @@
+Soldier 人物模型授权说明
+==========================
+
+	文件：soldier.glb（含 24 条骨骼动画，内嵌贴图）
+
+	作者 / 来源：
+	  - 原作者：Quaternius（https://quaternius.com）
+	  - 下载源：Cinevva 免费 CC0 角色库
+	    https://app.cinevva.com/game-assets/free-3d-character-models
+	    （CDN 直链：https://cdn.cinevva.com/assets/packs/quaternius/...）
+
+	许可：Creative Commons Zero 1.0（CC0，公有领域）
+	  https://creativecommons.org/publicdomain/zero/1.0/
+
+	  - 免费商用，无需署名，可修改、可随游戏分发
+	  - Cinevva 角色库明确标注所有模型为 CC0："Every model below is a
+	    single CC0 character... No account, no signup, no attribution
+	    required."
+
+	加工说明：
+	  - 原始 GLB 中身体各网格分别携带内容完全相同的重复 skin
+	    （关节与逆绑定矩阵逐字节一致），panda3d 的 glTF 转换器对这种
+	    "多 skin 共享单骨架"结构会因 characters[skinid] 缺失而加载失败。
+	  - 本仓库中的 soldier.glb 已合并重复 skin（仅去除重复项，
+	    几何 / 贴图 / 动画未做任何有损修改）。
+
+	若替换或重新下载该模型，请保留本授权说明。
