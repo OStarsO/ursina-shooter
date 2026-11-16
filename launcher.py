@@ -10,16 +10,22 @@
 
 import sys
 import os
+import io
 import json
 import math
 import random
 import struct
 import wave
 import shutil
+import socket
 import subprocess
+import http.client
+import urllib.error
+import urllib.parse
 import urllib.request
 import platform
 import time
+import zipfile
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -34,7 +40,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QGraphicsDropShadowEffect, QMessageBox, QComboBox, QSlider,
     QGridLayout, QTextEdit, QSizePolicy, QDialog, QStackedWidget,
-    QLineEdit, QScrollArea, QButtonGroup,
+    QLineEdit, QScrollArea, QButtonGroup, QProgressBar, QFileDialog,
 )
 
 from app_style import (
@@ -47,7 +53,7 @@ import net_ui
 # ============================ 基础常量 ============================
 
 APP_NAME = "射击启动器"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
@@ -82,6 +88,7 @@ DEFAULT_CONFIG = {
     "window_y": None,
     "nickname": "",
     "last_mode": "training",
+    "game_source_ref": "",
 }
 
 DEFAULT_GAME_SETTINGS = {
@@ -91,6 +98,343 @@ DEFAULT_GAME_SETTINGS = {
     "sensitivity": 40.0,
     "volume": 1.0,
 }
+
+# ============================ 游戏文件来源（GitHub） ============================
+# 客户端只带启动器本体，游戏本体（射击.py / 模块 / 资源）在首次运行或文件缺失时
+# 由启动器从公开仓库 OStarsO/ursina-shooter 下载补齐到玩家自己选择的目标目录。
+
+GAME_REPO_OWNER = "OStarsO"
+GAME_REPO_NAME = "ursina-shooter"
+GAME_REPO_REF = "main"
+GAME_ENTRY_NAME = "射击.py"
+
+GAME_USER_AGENT = (f"ShooterLauncher/{APP_VERSION} "
+                   f"(+https://github.com/{GAME_REPO_OWNER}/{GAME_REPO_NAME})")
+GAME_ARCHIVE_URL = "https://api.github.com/repos/{owner}/{repo}/zipball/{ref}"
+# 第二条整包通道：codeload 不走 API 限额
+GAME_ARCHIVE_FALLBACK_URL = "https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{ref}"
+GAME_TREE_URL = "https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
+GAME_CONTENT_URL = "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+
+# 需要落地的目录（游戏运行时读取）
+GAME_PAYLOAD_DIRS = ("assets/", "fonts/", "maps/", "sfx/", "characters/", "weapons/")
+# 不需要落地的顶层文件（启动器本体、测试、工具、文档、仓库配置）
+GAME_SKIP_TOP_FILES = (
+    "launcher.py", "requirements.txt", ".gitattributes", ".gitignore",
+    "LICENSE", "README.md",
+)
+GAME_SKIP_TOP_PREFIX = ("tests_", "tools/", "docs/", ".github/", "build_launcher/")
+# 包体积校验：至少留出这么多空间
+GAME_MIN_FREE_BYTES = 200 * 1024 * 1024
+GAME_CHUNK = 64 * 1024
+GAME_TIMEOUT = 45
+GAME_PART_SUFFIX = ".part"
+
+
+class GameDownloadError(Exception):
+    """下载/落盘失败，message 面向玩家展示"""
+
+
+def default_game_dir() -> Path:
+    """默认建议目标目录（玩家仍可自行选择）"""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "ShootingLauncher" / "游戏"
+
+
+def resolve_source_ref(cfg) -> str:
+    ref = str((cfg or {}).get("game_source_ref") or "").strip()
+    return ref or GAME_REPO_REF
+
+
+def is_game_payload(rel_path: str) -> bool:
+    """判断仓库内某个文件是否属于游戏运行所需"""
+    rel = rel_path.replace("\\", "/").strip("/")
+    if not rel:
+        return False
+    if rel.startswith(GAME_SKIP_TOP_PREFIX):
+        return False
+    if rel.startswith(GAME_PAYLOAD_DIRS):
+        return True
+    if "/" in rel:
+        return False
+    if rel in GAME_SKIP_TOP_FILES:
+        return False
+    return rel.endswith(".py")
+
+
+def _safe_join(root: Path, rel_path: str) -> Path:
+    """防止解包穿越（../ 或绝对路径）"""
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+    if not parts:
+        raise GameDownloadError(f"压缩包内出现异常路径：{rel_path}")
+    return root.joinpath(*parts)
+
+
+def _github_token() -> str:
+    """可选：环境变量里带令牌时提高 API 额度（不写入配置、不打印）"""
+    return (os.environ.get("SHOOTER_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+
+
+def _open_url(url: str, accept: str = "*/*", timeout: int = GAME_TIMEOUT):
+    headers = {
+        "User-Agent": GAME_USER_AGENT,
+        "Accept": accept,
+        "Cache-Control": "no-cache",
+    }
+    token = _github_token()
+    if token and "api.github.com" in url:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _describe_network_error(exc: BaseException, url: str) -> str:
+    """把网络异常翻译成玩家能看懂的提示"""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 404:
+            return (f"下载源返回 404：仓库 {GAME_REPO_OWNER}/{GAME_REPO_NAME} 或分支不存在，"
+                    f"请检查网络或稍后重试（{url}）")
+        if exc.code in (403, 429):
+            return "下载源拒绝访问（%d）：GitHub 接口访问过于频繁，请等待几分钟后重试" % exc.code
+        if 500 <= exc.code < 600:
+            return f"GitHub 服务暂时不可用（{exc.code}），请稍后重试"
+        return f"下载请求失败（HTTP {exc.code} {exc.reason}）"
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", exc)
+        return f"网络连接失败：{reason}。请检查网络、防火墙或代理设置后重试"
+    if isinstance(exc, (TimeoutError, OSError)) and "timed out" in str(exc).lower():
+        return "下载超时：GitHub 响应过慢，请检查网络后重试"
+    if isinstance(exc, (socket.timeout, http.client.HTTPException)):
+        return f"下载中断（{type(exc).__name__}），请重试"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _read_remote_bytes(url, accept="*/*", on_chunk=None, on_open=None,
+                       attempts=3, label=""):
+    """带重试的整段下载，返回 bytes；失败抛 GameDownloadError"""
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with _open_url(url, accept=accept) as resp:
+                if on_open:
+                    on_open(resp)
+                buf = io.BytesIO()
+                while True:
+                    chunk = resp.read(GAME_CHUNK)
+                    if not chunk:
+                        break
+                    buf.write(chunk)
+                    if on_chunk:
+                        on_chunk(len(chunk))
+                data = buf.getvalue()
+            if not data:
+                raise GameDownloadError(f"下载内容为空：{label or url}")
+            return data
+        except GameDownloadError:
+            raise
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500:
+                raise GameDownloadError(_describe_network_error(exc, url)) from exc
+            last = exc
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            last = exc
+        if attempt < attempts:
+            time.sleep(1.0 * attempt)
+            continue
+    raise GameDownloadError(_describe_network_error(last, url))
+
+
+def validate_game_dir(raw_text: str, need_bytes: int = GAME_MIN_FREE_BYTES):
+    """校验玩家选择的目录，返回 (Path, 错误提示)"""
+    text = (raw_text or "").strip().strip('"').strip("'")
+    if not text:
+        return None, "还没有选择游戏文件路径，请先点“浏览…”选择一个文件夹。"
+    try:
+        path = Path(os.path.expandvars(text)).expanduser()
+    except (OSError, ValueError) as exc:
+        return None, f"路径无效：{exc}"
+    if path.exists() and not path.is_dir():
+        return None, f"这个路径是一个文件，请选择文件夹：{path}"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"无法创建目录 {path}：{exc.strerror or exc}"
+    probe = path / ".launcher_write_test"
+    try:
+        probe.write_bytes(b"ok")
+        probe.unlink()
+    except OSError:
+        return None, f"目标目录没有写入权限，请换一个位置或改用管理员权限：{path}"
+    try:
+        free = shutil.disk_usage(str(path)).free
+    except OSError:
+        free = need_bytes
+    if free < need_bytes:
+        return None, (f"磁盘空间不足：{path} 所在磁盘剩余 {free / 1048576:.0f} MB，"
+                      f"至少需要 {need_bytes / 1048576:.0f} MB。")
+    # 目标目录不能是启动器自身所在目录的子路径以外的怪路径，这里只做规范化
+    try:
+        return path.resolve(), ""
+    except OSError as exc:
+        return None, f"路径无法解析：{exc}"
+
+
+def download_game_package(target_dir, ref=None, cfg=None, on_progress=None, on_log=None,
+                          url=None):
+    """下载仓库整包（zipball/zip）并落地游戏文件。返回 {"files": n, "bytes": n}"""
+    target = Path(target_dir)
+    ref = ref or resolve_source_ref(cfg)
+    url = url or GAME_ARCHIVE_URL.format(owner=GAME_REPO_OWNER, repo=GAME_REPO_NAME, ref=ref)
+    log = on_log or (lambda _m: None)
+    log(f"下载游戏包：{url}")
+
+    total = 0
+    done = 0
+
+    def _on_open(resp):
+        nonlocal total
+        length = resp.headers.get("Content-Length")
+        total = int(length) if length and length.isdigit() else 0
+
+    def _on_chunk(size):
+        nonlocal done
+        done += size
+        if on_progress:
+            on_progress(done, total, f"下载游戏包 {done / 1048576:.1f} MB")
+
+    raw = _read_remote_bytes(url, accept="application/zip", on_chunk=_on_chunk,
+                             on_open=_on_open, label="游戏包")
+    if len(raw) < 1024:
+        raise GameDownloadError("下载到的游戏包为空，请重试")
+    if raw[:2] != b"PK":
+        snippet = raw[:200].decode("utf-8", "replace").strip().replace("\n", " ")
+        raise GameDownloadError(f"下载源返回的不是游戏包（可能被接口限流）：{snippet[:150]}")
+    buf = io.BytesIO(raw)
+    files, written = 0, 0
+    try:
+        with zipfile.ZipFile(buf) as zf:
+            members = [m for m in zf.infolist() if not m.is_dir()]
+            picked = []
+            for m in members:
+                name = m.filename.replace("\\", "/")
+                parts = name.split("/", 1)
+                rel = parts[1] if len(parts) == 2 else ""
+                if rel and is_game_payload(rel):
+                    picked.append((m, rel))
+            if not picked:
+                raise GameDownloadError("游戏包里没有找到游戏文件，请稍后重试")
+            all_bytes = sum(m.file_size for m, _ in picked)
+            for index, (member, rel) in enumerate(picked, 1):
+                dest = _safe_join(target, rel)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_name(dest.name + GAME_PART_SUFFIX)
+                try:
+                    with zf.open(member) as src, open(tmp, "wb") as out:
+                        shutil.copyfileobj(src, out, GAME_CHUNK)
+                    os.replace(tmp, dest)
+                except OSError as exc:
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except OSError:
+                        pass
+                    raise GameDownloadError(
+                        f"写入游戏文件失败：{dest}（{exc.strerror or exc}）。"
+                        f"请确认该目录没有被占用，或换一个位置。"
+                    ) from exc
+                files += 1
+                written += member.file_size
+                if on_progress:
+                    on_progress(written, all_bytes, f"写入 {rel}")
+    except zipfile.BadZipFile as exc:
+        raise GameDownloadError("游戏包解压失败（文件不完整），请重试") from exc
+
+    if not (target / GAME_ENTRY_NAME).is_file():
+        raise GameDownloadError(f"补齐后仍找不到 {GAME_ENTRY_NAME}，请重试或手动指定已有游戏目录")
+    log(f"游戏文件落地完成：{files} 个文件，{written / 1048576:.1f} MB")
+    return {"files": files, "bytes": written}
+
+
+def download_game_files(target_dir, ref=None, cfg=None, on_progress=None, on_log=None):
+    """逐个文件走 Contents API 下载（备用通道，zipball 不可用时使用）"""
+    target = Path(target_dir)
+    ref = ref or resolve_source_ref(cfg)
+    log = on_log or (lambda _m: None)
+    tree_url = GAME_TREE_URL.format(owner=GAME_REPO_OWNER, repo=GAME_REPO_NAME, ref=ref)
+    log(f"读取文件清单：{tree_url}")
+    try:
+        raw_tree = _read_remote_bytes(tree_url, accept="application/vnd.github+json",
+                                      label="文件清单")
+        data = json.loads(raw_tree.decode("utf-8"))
+    except GameDownloadError:
+        raise
+    except ValueError as exc:
+        raise GameDownloadError(f"文件清单解析失败：{exc}") from exc
+
+    entries = [e for e in data.get("tree", [])
+               if e.get("type") == "blob" and is_game_payload(e.get("path", ""))]
+    if not entries:
+        raise GameDownloadError("仓库文件清单为空，请稍后重试")
+    total = sum(int(e.get("size") or 0) for e in entries)
+    done_total, files = 0, 0
+    for entry in entries:
+        rel = entry["path"]
+        url = GAME_CONTENT_URL.format(owner=GAME_REPO_OWNER, repo=GAME_REPO_NAME,
+                                      path=urllib.parse.quote(rel), ref=ref)
+        dest = _safe_join(target, rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + GAME_PART_SUFFIX)
+        try:
+            payload = _read_remote_bytes(url, accept="application/vnd.github.raw",
+                                         label=rel)
+        except GameDownloadError as exc:
+            raise GameDownloadError(f"下载 {rel} 失败：{exc}") from exc
+        try:
+            with open(tmp, "wb") as out:
+                out.write(payload)
+            os.replace(tmp, dest)
+        except OSError as exc:
+            raise GameDownloadError(
+                f"写入游戏文件失败：{dest}（{exc.strerror or exc}）") from exc
+        files += 1
+        done_total += len(payload)
+        if on_progress:
+            on_progress(done_total, max(total, done_total), f"下载 {rel}")
+
+    if not (target / GAME_ENTRY_NAME).is_file():
+        raise GameDownloadError(f"补齐后仍找不到 {GAME_ENTRY_NAME}，请重试")
+    log(f"游戏文件落地完成：{files} 个文件，{done_total / 1048576:.1f} MB")
+    return {"files": files, "bytes": done_total}
+
+
+def fetch_game_files(target_dir, ref=None, cfg=None, on_progress=None, on_log=None):
+    """整包（API）→ 整包（codeload）→ 逐文件，依次尝试；全部失败抛 GameDownloadError"""
+    log = on_log or (lambda _m: None)
+    ref = ref or resolve_source_ref(cfg)
+    channels = (
+        # codeload 不走 API 限额，优先使用
+        ("codeload zip", GAME_ARCHIVE_FALLBACK_URL.format(owner=GAME_REPO_OWNER,
+                                                          repo=GAME_REPO_NAME, ref=ref)),
+        ("api zipball", GAME_ARCHIVE_URL.format(owner=GAME_REPO_OWNER,
+                                                repo=GAME_REPO_NAME, ref=ref)),
+    )
+    errors = []
+    for name, url in channels:
+        try:
+            return download_game_package(target_dir, ref=ref, cfg=cfg, url=url,
+                                         on_progress=on_progress, on_log=log)
+        except GameDownloadError as exc:
+            errors.append(f"{name}：{exc}")
+            log(f"{name} 失败：{exc}")
+            log("换下一个下载通道…")
+    log("整包通道都失败，改用逐文件下载…")
+    try:
+        return download_game_files(target_dir, ref=ref, cfg=cfg,
+                                   on_progress=on_progress, on_log=log)
+    except GameDownloadError as exc:
+        errors.append(f"逐文件：{exc}")
+    detail = "；".join(errors)
+    raise GameDownloadError(f"游戏文件下载失败：{detail}")
 
 
 # ============================ 配置读写 ============================
@@ -122,13 +466,21 @@ def save_config(cfg: dict):
 # ============================ 路径发现 ============================
 
 def locate_game(cfg: dict) -> Path:
-    """按优先级查找 射击.py"""
+    """按优先级查找 射击.py（cfg["game_path"] 可以是目录，也可以是文件）"""
     candidates = []
-    if cfg.get("game_path"):
-        candidates.append(Path(cfg["game_path"]))
+    raw = str(cfg.get("game_path") or "").strip()
+    if raw:
+        try:
+            p = Path(os.path.expandvars(raw)).expanduser()
+            if p.is_dir():
+                p = p / GAME_ENTRY_NAME
+            candidates.append(p)
+        except (OSError, ValueError):
+            pass
     candidates += [
-        BASE_DIR / "射击.py",
-        BASE_DIR.parent / "射击.py",
+        BASE_DIR / GAME_ENTRY_NAME,
+        BASE_DIR.parent / GAME_ENTRY_NAME,
+        default_game_dir() / GAME_ENTRY_NAME,
         Path(r"D:/PyCharmMiscProject/射击/射击.py"),
     ]
     for path in candidates:
@@ -137,7 +489,9 @@ def locate_game(cfg: dict) -> Path:
                 return path.resolve()
         except OSError:
             continue
-    return BASE_DIR / "射击.py"
+    if candidates and isinstance(candidates[0], Path):
+        return candidates[0]
+    return BASE_DIR / GAME_ENTRY_NAME
 
 
 def game_dir_of(game_path: Path) -> Path:
@@ -386,6 +740,36 @@ class RepairThread(QThread):
             self.done.emit(False, f"{type(exc).__name__}: {exc}")
 
 
+class GamePackageThread(QThread):
+    """从 GitHub 下载游戏文件到玩家选择的目录"""
+    progress = Signal(int, int, str)     # 已完成字节 / 总字节 / 文案
+    log = Signal(str)
+    done = Signal(bool, str, dict)       # 成功? / 提示 / 结果
+
+    def __init__(self, target_dir, ref=None, cfg=None, parent=None):
+        super().__init__(parent)
+        self.target_dir = Path(target_dir)
+        self.ref = ref
+        self.cfg = cfg or {}
+        self.cancelled = False
+
+    def run(self):
+        self.log.emit(f"目标目录：{self.target_dir}")
+        try:
+            info = fetch_game_files(
+                self.target_dir, ref=self.ref, cfg=self.cfg,
+                on_progress=lambda d, t, m: self.progress.emit(d, t, m),
+                on_log=lambda m: self.log.emit(m),
+            )
+        except GameDownloadError as exc:
+            self.done.emit(False, str(exc), {})
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(False, f"补齐游戏文件时发生未知错误：{type(exc).__name__}: {exc}", {})
+            return
+        self.done.emit(True, str(self.target_dir), info)
+
+
 # ============================ 自绘组件 ============================
 
 class StatusDot(QWidget):
@@ -548,6 +932,234 @@ class LogBox(QTextEdit):
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
 
+# ============================ 游戏文件补齐对话框 ============================
+
+class GameSetupDialog(QDialog):
+    """让玩家先选目标路径，再从 GitHub 下载补齐游戏文件"""
+
+    def __init__(self, parent=None, cfg=None, reason="", start_dir=None):
+        super().__init__(parent)
+        self.cfg = dict(cfg or {})
+        self.chosen_dir = None
+        self.thread = None
+        self.setWindowTitle(f"{APP_NAME} · 补齐游戏文件")
+        self.setMinimumWidth(660)
+        self.setStyleSheet(f"""
+            QDialog {{ background: {C_PANEL}; }}
+            QLabel {{ color: {C_TEXT}; }}
+            QLabel#Title {{ font-size: 16px; font-weight: 700; letter-spacing: 1px; }}
+            QLabel#Hint {{ color: {C_MUTED}; font-size: 11px; }}
+            QLineEdit {{
+                background: {C_PANEL_2}; border: 1px solid {C_BORDER};
+                border-radius: 8px; padding: 7px 10px; color: {C_TEXT};
+            }}
+            QPushButton#Ghost {{
+                background: rgba(255, 255, 255, 0.03); border: 1px solid #2A3648;
+                border-radius: 8px; padding: 6px 14px; color: #B9C6D9;
+            }}
+            QPushButton#Ghost:hover {{ border-color: {C_ACCENT}; color: {C_TEXT}; }}
+            QPushButton#Primary {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                            stop:0 {C_ACCENT}, stop:1 #FF8B57);
+                border: none; border-radius: 10px; padding: 9px 22px;
+                color: #1A0D06; font-size: 13px; font-weight: 800; letter-spacing: 1px;
+            }}
+            QPushButton#Primary:disabled {{ background: #2A3342; color: {C_MUTED}; }}
+            QProgressBar {{
+                background: {C_PANEL_2}; border: 1px solid {C_BORDER};
+                border-radius: 5px; height: 8px; text-align: center; color: {C_MUTED};
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                            stop:0 {C_ACCENT}, stop:1 #FF8B57);
+                border-radius: 4px;
+            }}
+            QTextEdit#LogBox {{
+                background: {C_PANEL_2}; border: 1px solid {C_BORDER};
+                border-radius: 8px; color: #9FB0C8; padding: 8px;
+            }}
+            QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
+            QScrollBar::handle:vertical {{ background: #33425A; border-radius: 4px; min-height: 24px; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
+        self._build_ui(reason, start_dir)
+
+    # ---------- 界面 ----------
+    def _build_ui(self, reason, start_dir):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(10)
+
+        title = QLabel("选择游戏文件保存位置")
+        title.setObjectName("Title")
+        lay.addWidget(title)
+
+        hint = QLabel(reason or (
+            "当前机器上还没有游戏文件。客户端只自带启动器本体，"
+            f"游戏文件会从 GitHub（{GAME_REPO_OWNER}/{GAME_REPO_NAME}）下载补齐。"
+        ))
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.edit_path = QLineEdit(str(start_dir or default_game_dir()))
+        self.edit_path.setPlaceholderText("例如 D:\\Games\\射击")
+        self.edit_path.editingFinished.connect(self._revalidate)
+        self.btn_browse = QPushButton("浏览…")
+        self.btn_browse.setObjectName("Ghost")
+        self.btn_browse.setCursor(Qt.PointingHandCursor)
+        self.btn_browse.clicked.connect(self._browse)
+        row.addWidget(self.edit_path, 1)
+        row.addWidget(self.btn_browse)
+        lay.addLayout(row)
+
+        self.lbl_tip = QLabel("")
+        self.lbl_tip.setObjectName("Hint")
+        self.lbl_tip.setWordWrap(True)
+        lay.addWidget(self.lbl_tip)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        lay.addWidget(self.bar)
+
+        self.log_box = LogBox()
+        self.log_box.setMinimumHeight(126)
+        lay.addWidget(self.log_box, 1)
+
+        self.lbl_license = QLabel(
+            "游戏文件以 PolyForm Noncommercial 1.0.0 授权发布，仅限非商业用途。"
+        )
+        self.lbl_license.setObjectName("Hint")
+        lay.addWidget(self.lbl_license)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch(1)
+        self.btn_later = QPushButton("稍后再说")
+        self.btn_later.setObjectName("Ghost")
+        self.btn_later.setCursor(Qt.PointingHandCursor)
+        self.btn_later.clicked.connect(self.reject)
+        self.btn_start = QPushButton("开始下载并补齐")
+        self.btn_start.setObjectName("Primary")
+        self.btn_start.setCursor(Qt.PointingHandCursor)
+        self.btn_start.clicked.connect(self._start)
+        btn_row.addWidget(self.btn_later)
+        btn_row.addWidget(self.btn_start)
+        lay.addLayout(btn_row)
+
+        self._revalidate()
+
+    def _tip(self, text, color=C_MUTED):
+        self.lbl_tip.setText(text)
+        self.lbl_tip.setStyleSheet(f"color:{color}; font-size:11px;")
+
+    def _revalidate(self):
+        if self.thread and self.thread.isRunning():
+            return
+        path, err = validate_game_dir(self.edit_path.text())
+        if err:
+            self._tip(err, C_WARN)
+            self.btn_start.setEnabled(False)
+        else:
+            exists = (path / GAME_ENTRY_NAME).is_file()
+            self._tip(("该目录已有游戏文件：下载将刷新为仓库最新版本。" if exists
+                       else f"将把游戏文件写入：{path}"), C_INFO if exists else C_MUTED)
+            self.btn_start.setEnabled(True)
+
+    def _browse(self):
+        start = self.edit_path.text().strip() or str(default_game_dir())
+        chosen = QFileDialog.getExistingDirectory(self, "选择游戏文件保存位置", start)
+        if chosen:
+            self.edit_path.setText(chosen)
+            self._revalidate()
+
+    # ---------- 下载 ----------
+    def _start(self):
+        if self.thread and self.thread.isRunning():
+            return
+        path, err = validate_game_dir(self.edit_path.text())
+        if err:
+            self._tip(err, C_BAD)
+            QMessageBox.warning(self, "路径不可用", err)
+            return
+        if (path / GAME_ENTRY_NAME).is_file():
+            answer = QMessageBox.question(
+                self, "覆盖确认",
+                f"该目录已存在游戏文件：\n{path}\n\n继续会从 GitHub 重新下载并覆盖同名文件，是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        self.edit_path.setText(str(path))
+        self.chosen_dir = path
+        self.log_box.clear()
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(0)
+        self.btn_start.setEnabled(False)
+        self.btn_browse.setEnabled(False)
+        self.edit_path.setEnabled(False)
+        self.btn_later.setEnabled(False)
+        self._tip("正在连接 GitHub…", C_INFO)
+        self.thread = GamePackageThread(path, ref=resolve_source_ref(self.cfg),
+                                       cfg=self.cfg, parent=self)
+        self.thread.progress.connect(self._on_progress)
+        self.thread.log.connect(self.log_box.append_line)
+        self.thread.done.connect(self._on_done)
+        self.thread.start()
+
+    def _on_progress(self, done, total, message):
+        if total > 0:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(max(0, min(1000, int(done * 1000 / total))))
+            self._tip(f"{message}（{done / 1048576:.1f} / {total / 1048576:.1f} MB）", C_INFO)
+        else:
+            self.bar.setRange(0, 0)
+            self.bar.setValue(0)
+            self._tip(f"{message}（{done / 1048576:.1f} MB）", C_INFO)
+
+    def _on_done(self, ok, message, info):
+        self.btn_browse.setEnabled(True)
+        self.edit_path.setEnabled(True)
+        self.btn_later.setEnabled(True)
+        self.btn_start.setEnabled(True)
+        self.bar.setRange(0, 1000)
+        if ok:
+            self.bar.setValue(1000)
+            files = info.get("files", 0) if isinstance(info, dict) else 0
+            size = (info.get("bytes", 0) / 1048576) if isinstance(info, dict) else 0.0
+            self._tip(f"补齐完成：{files} 个文件，{size:.1f} MB。", C_OK)
+            self.log_box.append_line("补齐完成，可以开始游戏了。")
+            QTimer.singleShot(600, self.accept)
+            return
+        self.bar.setValue(0)
+        self._tip(f"补齐失败：{message}", C_BAD)
+        self.log_box.append_line(f"补齐失败：{message}")
+        box = QMessageBox(self)
+        box.setWindowTitle("下载失败")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("游戏文件下载失败。")
+        box.setInformativeText(f"{message}\n\n可以检查网络后点“开始下载并补齐”重试，"
+                              f"或点“浏览…”换一个可写的目录。")
+        box.exec()
+
+    def closeEvent(self, event):
+        if self.thread and self.thread.isRunning():
+            event.ignore()
+            self._tip("正在下载游戏文件，请等待完成后再关闭。", C_WARN)
+            return
+        super().closeEvent(event)
+
+    def reject(self):
+        if self.thread and self.thread.isRunning():
+            self._tip("正在下载游戏文件，请等待完成后再关闭。", C_WARN)
+            return
+        super().reject()
+
+
 # ============================ 主窗口 ============================
 
 class LauncherWindow(QWidget):
@@ -578,7 +1190,10 @@ class LauncherWindow(QWidget):
         self._restore_position()
         self._refresh_scores()
         self._load_settings_into_ui(read_game_settings(self.game_dir))
+        self._refresh_game_row()
         QTimer.singleShot(180, self.start_env_check)
+        # 缺少游戏文件时，先让玩家选择目标路径再下载补齐
+        QTimer.singleShot(900, self._prompt_missing_game)
 
     # ---------- 样式 ----------
     def _apply_global_style(self):
@@ -882,6 +1497,11 @@ class LauncherWindow(QWidget):
 
     # ---------- 公告页 ----------
     DEFAULT_NOTICES = [
+        ("2026-11-16", "v1.2.0 客户端更新",
+         "新增「选择路径 + 从 GitHub 下载补齐游戏文件」：客户端只自带启动器本体，"
+         "首次启动会先让你选择游戏文件保存位置，再从 GitHub（OStarsO/ursina-shooter）"
+         "下载补齐；路径无效、磁盘不足、下载失败都会给出明确提示，可随时在"
+         "「设置 → 选择路径 / 下载游戏文件」重新补齐或更换目录。"),
         ("2026-11-12", "v1.1.0 客户端更新",
          "主界面顶部新增「公告 / 设置 / 控制台 / 我的」导航；环境自检、游戏设置、战绩与联机入口已按页面归类。"),
         ("2026-11-12", "玩法提示",
@@ -950,10 +1570,28 @@ class LauncherWindow(QWidget):
         btn_row.addStretch(1)
         env_card.head.addLayout(btn_row)
 
+        self.row_game = StatusRow("游戏文件")
+        self.btn_pick_game = QPushButton("选择路径")
+        self.btn_pick_game.setObjectName("Ghost")
+        self.btn_pick_game.setCursor(Qt.PointingHandCursor)
+        self.btn_pick_game.clicked.connect(self.pick_game_path)
+        self.btn_fetch_game = QPushButton("下载游戏文件")
+        self.btn_fetch_game.setObjectName("Ghost")
+        self.btn_fetch_game.setCursor(Qt.PointingHandCursor)
+        self.btn_fetch_game.clicked.connect(self.open_game_setup)
+        game_btn_row = QHBoxLayout()
+        game_btn_row.setContentsMargins(0, 0, 0, 6)
+        game_btn_row.setSpacing(8)
+        game_btn_row.addWidget(self.btn_pick_game)
+        game_btn_row.addWidget(self.btn_fetch_game)
+        game_btn_row.addStretch(1)
+
         self.row_python = StatusRow("解释器")
         self.row_engine = StatusRow("引擎")
         self.row_font = StatusRow("中文字体")
         self.row_audio = StatusRow("音效")
+        env_card.content.addWidget(self.row_game)
+        env_card.content.addLayout(game_btn_row)
         for r in (self.row_python, self.row_engine, self.row_font, self.row_audio):
             env_card.content.addWidget(r)
         lay.addWidget(env_card)
@@ -1245,6 +1883,75 @@ class LauncherWindow(QWidget):
             self.game_proc.waitForFinished(1500)
         super().closeEvent(event)
 
+    # ---------- 游戏文件补齐 ----------
+    def _refresh_game_row(self):
+        if not hasattr(self, "row_game"):
+            return
+        path = self.game_path
+        if path.is_file():
+            try:
+                size_kb = path.stat().st_size / 1024
+            except OSError:
+                size_kb = 0
+            self.row_game.set_state("ok", f"{path.name} · {size_kb:.0f} KB")
+            if hasattr(self, "lbl_path"):
+                self.lbl_path.setText(str(path))
+        else:
+            self.row_game.set_state("warn", "缺失 · 需从 GitHub 下载补齐")
+            if hasattr(self, "lbl_path"):
+                self.lbl_path.setText(f"{self.game_dir}（游戏文件缺失）")
+
+    def _apply_game_dir(self, target):
+        target = Path(target)
+        self.game_path = target / GAME_ENTRY_NAME
+        self.game_dir = target
+        self.cfg["game_path"] = str(target)
+        save_config(self.cfg)
+        self._refresh_game_row()
+        self._refresh_scores()
+        self._load_settings_into_ui(read_game_settings(self.game_dir))
+        self.flash_status(f"游戏目录：{target}")
+
+    def pick_game_path(self):
+        start = str(self.game_dir) if str(self.game_dir) else str(default_game_dir())
+        chosen = QFileDialog.getExistingDirectory(self, "选择游戏文件目录", start)
+        if not chosen:
+            return
+        path, err = validate_game_dir(chosen)
+        if err:
+            QMessageBox.warning(self, "路径不可用", err)
+            return
+        self._apply_game_dir(path)
+
+    def open_game_setup(self, checked=False, reason=""):
+        """打开“选择路径 + 下载补齐”对话框"""
+        start = self.game_dir if str(self.game_dir) else default_game_dir()
+        dlg = GameSetupDialog(self, cfg=self.cfg, reason=reason, start_dir=start)
+        if dlg.exec() == QDialog.Accepted and dlg.chosen_dir:
+            self._apply_game_dir(dlg.chosen_dir)
+            self.start_env_check()
+            self._refresh_game_row()
+            return True
+        self._refresh_game_row()
+        return False
+
+    def ensure_game_files(self, reason=""):
+        """游戏文件不存在时先让玩家选路径并下载"""
+        if self.game_path.is_file():
+            return True
+        tip = reason or (
+            f"找不到游戏文件：\n{self.game_path}\n\n"
+            "请先选择保存位置，客户端会从 GitHub 下载补齐游戏文件。"
+        )
+        return self.open_game_setup(reason=tip)
+
+    def _prompt_missing_game(self):
+        if self.game_path.is_file():
+            self._refresh_game_row()
+            return
+        self._refresh_game_row()
+        self.ensure_game_files()
+
     # ---------- 环境自检 ----------
     def start_env_check(self):
         self.row_python.set_state("wait", "检测中…")
@@ -1281,6 +1988,9 @@ class LauncherWindow(QWidget):
             self.lbl_status.setText("环境就绪")
             self.btn_launch.setEnabled(True)
             self.btn_repair.setVisible(False)
+            if not self.game_path.is_file():
+                self.lbl_status.setText("环境就绪 · 游戏文件缺失，请先下载补齐")
+            self._refresh_game_row()
         else:
             self.row_python.set_state("bad", info.get("error", "不可用"))
             self.row_engine.set_state("bad", "未检测到 ursina")
@@ -1483,8 +2193,14 @@ class LauncherWindow(QWidget):
         if not python:
             QMessageBox.warning(self, "无法启动", "未找到可用的 Python 环境，请先点“修复环境”。")
             return False
+        if not self.game_path.is_file() and not self.ensure_game_files():
+            return False
         if not self.game_path.is_file():
-            QMessageBox.warning(self, "无法启动", f"找不到游戏文件：\n{self.game_path}")
+            QMessageBox.warning(
+                self, "无法启动",
+                f"仍然找不到游戏文件：\n{self.game_path}\n\n"
+                "请点“设置 → 选择路径 / 下载游戏文件”重新补齐。",
+            )
             return False
 
         args = [str(self.game_path)] + list(extra_args or [])
@@ -1694,6 +2410,29 @@ def acquire_single_instance():
 
 # ============================ selftest / 截图 ============================
 
+def run_fetch_game(target, ref=None):
+    """命令行补齐游戏文件（无界面，便于自检/排错）"""
+    cfg = load_config()
+    path, err = validate_game_dir(target)
+    if err:
+        print(f"[路径不可用] {err}")
+        return 2
+    print(f"目标目录：{path}")
+    try:
+        info = fetch_game_files(
+            path, ref=ref or resolve_source_ref(cfg), cfg=cfg,
+            on_progress=lambda d, t, m: print(f"  {m}"),
+            on_log=lambda m: print(m),
+        )
+    except GameDownloadError as exc:
+        print(f"[下载失败] {exc}")
+        return 3
+    entry = path / GAME_ENTRY_NAME
+    print(f"完成：{info['files']} 个文件，{info['bytes'] / 1048576:.1f} MB")
+    print(f"{GAME_ENTRY_NAME} 存在：{entry.is_file()}（{entry.stat().st_size if entry.is_file() else 0} B）")
+    return 0 if entry.is_file() else 4
+
+
 def run_selftest():
     cfg = load_config()
     game_path = locate_game(cfg)
@@ -1703,6 +2442,16 @@ def run_selftest():
         "frozen": FROZEN,
         "game_path": str(game_path),
         "game_exists": game_path.is_file(),
+        "game_source": {
+            "repo": f"{GAME_REPO_OWNER}/{GAME_REPO_NAME}",
+            "ref": resolve_source_ref(cfg),
+            "archive_urls": [
+                GAME_ARCHIVE_FALLBACK_URL.format(
+                    owner=GAME_REPO_OWNER, repo=GAME_REPO_NAME, ref=resolve_source_ref(cfg)),
+                GAME_ARCHIVE_URL.format(
+                    owner=GAME_REPO_OWNER, repo=GAME_REPO_NAME, ref=resolve_source_ref(cfg)),
+            ],
+        },
         "settings": read_game_settings(game_dir),
         "scores": read_scores(game_dir),
         "font": check_font(game_dir),
@@ -1795,6 +2544,15 @@ def main():
     argv = sys.argv[1:]
     if "--selftest" in argv:
         return run_selftest()
+    if "--fetch-game" in argv:
+        idx = argv.index("--fetch-game")
+        target = argv[idx + 1] if len(argv) > idx + 1 else str(default_game_dir())
+        ref = None
+        if "--ref" in argv:
+            ridx = argv.index("--ref")
+            if len(argv) > ridx + 1:
+                ref = argv[ridx + 1]
+        return run_fetch_game(target, ref)
     if "--screenshot" in argv:
         idx = argv.index("--screenshot")
         out = argv[idx + 1] if idx + 1 < len(argv) else "launcher.png"
