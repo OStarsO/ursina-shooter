@@ -24,6 +24,8 @@ hit.wav
 hit.ogg
 # 程序化生成的 UI 贴图，运行时重建
 ui_cache/
+# 运行时从系统复制过来的中文字体缓存
+fonts/_cache/
 
 # ---- 编辑器 / 系统 ----
 .idea/

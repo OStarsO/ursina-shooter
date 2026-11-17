@@ -16,19 +16,28 @@ ursina 的 UI 空间：y ∈ [-0.5, 0.5]，x ∈ [-aspect/2, aspect/2]。
 
 字体约定
 --------
-Panda3D 的字体加载对含中文的绝对路径不友好，因此统一使用
-``fonts/xxx.ttf`` 相对路径（启动器会把工作目录设为游戏目录）。
-含中文的文本必须用 ``FONT_CJK``，纯数字/英文用 Rajdhani / Barlow Condensed，
-HUD 数字才有 CS:GO 那种窄体科技感。
+内外两层规则：
+* 随包字体（``fonts/xxx.ttf``）用相对路径 —— 它们就在游戏目录里，Panda3D 能稳定加载。
+* 系统中文字体（msyh / simhei / simsun…）有两道保险：
+  1. 把系统字体目录挂进 Panda3D 的 model path（``getModelPath().appendDirectory``），
+     这样裸文件名也能被 ``loader.loadFont`` 找到；
+  2. 首次启动时把选中的中文字体缓存一份到 ``<游戏目录>/fonts/``，此后一律用相对路径
+     ``fonts/xxx`` 加载 —— 兼容那些自己做路径解析的 ursina 版本。
+  绝对路径 ``C:\\Windows\\Fonts\\msyh.ttc`` 直接传给 Text 是不可行的：Panda3D 只认
+  model path 里的 Unix 风格路径，会报 ``Unable to find font file``。
+* 系统里一个中文矢量字体都没有时退回内置英文字体，界面照常起来（中文可能显示为方块）。
 """
 from __future__ import annotations
 
 import math
+import os
 import random
+import shutil
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
-from ursina import Button, Entity, Text, camera, color, time, window
+from ursina import (Button, Entity, Text, application, camera, color, time,
+                    window)
 
 import glass as _glass
 
@@ -55,7 +64,14 @@ TEXT_ON_ACTIVE = (245, 249, 252)
 FONT_NUM = 'fonts/Rajdhani-Bold.ttf'
 FONT_UI = 'fonts/BarlowCondensed-SemiBold.ttf'
 FONT_CJK = 'msyh.ttc'
-FONT_CJK_CANDIDATES = ('msyh.ttc', 'msyhbd.ttc', 'simhei.ttf', 'simsun.ttc')
+FONT_CJK_CANDIDATES = (
+    'msyh.ttc', 'msyhbd.ttc', 'msyhl.ttc',          # 微软雅黑
+    'simhei.ttf', 'simsun.ttc', 'simkai.ttf', 'simfang.ttf',  # 黑体/宋体/楷体/仿宋
+    'Deng.ttf', 'DengXian.ttf',                      # 等线
+    'msjh.ttc', 'msjhl.ttc',                         # 微软正黑（繁体系统）
+    'NotoSansCJKsc-Regular.otf', 'NotoSansSC-Regular.otf',
+    'SourceHanSansSC-Regular.otf',                   # 开源字体（Linux/部分精简系统）
+)
 
 # ------------------------------------------------------------------ 尺度
 REF_H = 900.0
@@ -305,9 +321,106 @@ def font_for(text: str, style: str = 'ui') -> str:
     return FONT_NUM if style == 'num' else FONT_UI
 
 
-def _loadable(name: str) -> bool:
+def _font_roots() -> list:
+    """可能放字体的目录：游戏自带 fonts/ → 系统字体目录 → 用户自装字体目录"""
+    roots = [Path('fonts'), Path('.')]
+    win = os.environ.get('WINDIR') or os.environ.get('SystemRoot') or r'C:\Windows'
+    roots.append(Path(win) / 'Fonts')
+    local = os.environ.get('LOCALAPPDATA')
+    if local:
+        roots.append(Path(local) / 'Microsoft' / 'Windows' / 'Fonts')
     try:
-        t = Text(text='测A1', font=name)
+        asset = Path(getattr(application, 'asset_folder', ''))
+        if str(asset) not in ('', '.'):
+            roots.extend([asset, asset / 'fonts'])
+    except Exception:
+        pass
+    out = []
+    for r in roots:
+        if r not in out:
+            out.append(r)
+    return out
+
+
+def resolve_font(name: str):
+    """把字体名解析成真实存在的绝对路径；找不到返回 None。
+
+    裸文件名只相对 asset_folder 解析会失败（游戏目录里没有系统字体），
+    所以这里显式搜系统字体目录，并做一次大小写不敏感兜底（SIMLI.TTF 这种）。
+    """
+    p = Path(str(name))
+    if p.is_absolute():
+        return p if p.is_file() else None
+    roots = _font_roots()
+    for root in roots:
+        try:
+            cand = root / p
+            if cand.is_file():
+                return cand.resolve()
+        except OSError:
+            continue
+    low = p.name.lower()
+    for root in roots:
+        try:
+            for f in root.iterdir():
+                if f.suffix.lower() in ('.ttf', '.ttc', '.otf') and f.name.lower() == low:
+                    return f.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _exists_in_roots(name: str) -> bool:
+    """字体文件在任一搜索目录里存在（大小写不敏感兜底 SIMLI.TTF 这种）。"""
+    p = Path(str(name))
+    if p.is_absolute():
+        return p.is_file()
+    low = p.name.lower()
+    for root in _font_roots():
+        try:
+            if (root / p).is_file():
+                return True
+        except OSError:
+            continue
+    for root in _font_roots():
+        try:
+            for f in root.iterdir():
+                if f.name.lower() == low:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _register_font_dirs() -> int:
+    """把字体所在目录挂进 Panda3D 的 model path，返回新增目录数。
+
+    Panda3D 的 loadFont() 不是直接读文件系统路径，而是走 model path 搜索；
+    绝对路径（C:\\Windows\\Fonts\\msyh.ttc）会报 “expected Unix-style path”，
+    所以正确做法是把目录加进搜索路径，再用裸文件名加载。
+    """
+    try:
+        from panda3d.core import getModelPath
+    except Exception:
+        return 0
+    mp = getModelPath()
+    added = 0
+    for root in _font_roots():
+        try:
+            if not root.is_dir():
+                continue
+            unix = str(root.resolve()).replace('\\', '/')
+            if unix not in mp:
+                mp.appendDirectory(unix)
+                added += 1
+        except Exception:
+            continue
+    return added
+
+
+def _loadable(name) -> bool:
+    try:
+        t = Text(text='测A1', font=str(name))
         ok = getattr(t, '_font', None) is not None
         t.enabled = False
         return bool(ok)
@@ -315,17 +428,55 @@ def _loadable(name: str) -> bool:
         return False
 
 
+def _cache_font_locally(src) -> str:
+    """把系统字体复制到 <游戏目录>/fonts/ 下，返回相对路径；失败返回空串。
+
+    拷贝一次即可（同名同大小就直接复用），之后 Text 用 'fonts/xxx' 这种
+    相对路径加载，任何 ursina 版本都稳。
+    """
+    try:
+        src = Path(src)
+        asset = Path(getattr(application, 'asset_folder', '.') or '.')
+        target_dir = asset / 'fonts' / '_cache'
+        target = target_dir / src.name
+        if target.is_file() and target.stat().st_size == src.stat().st_size:
+            return f'fonts/_cache/{src.name}'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+        return f'fonts/_cache/{src.name}'
+    except Exception as exc:
+        print(f'warning: 缓存中文字体失败（{exc}），改用 model path 加载')
+        return ''
+
+
 def init_theme() -> str:
-    """生成贴图、选定中文字体，返回实际使用的中文字体名。"""
+    """生成贴图、选定中文字体，返回实际使用的中文字体名（相对路径或内置字体名）。"""
     global FONT_CJK, _FONT_READY
     if _FONT_READY:
         return FONT_CJK
     _build_textures()
+    _register_font_dirs()
+    chosen = None
     for name in FONT_CJK_CANDIDATES:
-        if _loadable(name):
-            FONT_CJK = name
-            break
-    Text.default_font = FONT_CJK
+        if not _exists_in_roots(name):
+            continue
+        if not _loadable(name):
+            continue
+        cached = _cache_font_locally(resolve_font(name) or name)
+        if cached and _loadable(cached):
+            chosen = cached
+        else:
+            chosen = name
+        break
+    if chosen is None:
+        chosen = FONT_UI
+        print('warning: 找不到可用的中文矢量字体（msyh/simhei/simsun…），'
+              '界面中文可能显示为方块；请安装“微软雅黑”或在 fonts/ 放入中文字体')
+    FONT_CJK = chosen
+    try:
+        Text.default_font = chosen
+    except Exception as exc:
+        print(f'warning: 设置默认字体失败（{exc}），沿用 ursina 默认字体')
     _FONT_READY = True
     return FONT_CJK
 
