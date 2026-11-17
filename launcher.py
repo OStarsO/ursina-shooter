@@ -55,6 +55,12 @@ import net_ui
 APP_NAME = "射击启动器"
 APP_VERSION = "1.2.0"
 
+# 打包成 windowed exe 后没有控制台，sys.stdout/stderr 为 None，print 会抛 AttributeError
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 
@@ -2410,26 +2416,61 @@ def acquire_single_instance():
 
 # ============================ selftest / 截图 ============================
 
+def _early_fetch_log(msg):
+    """游戏目录都不可用时的兜底日志（打包成无控制台 exe 后看不到 print）"""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_DIR / "launcher_fetch.log", "a", encoding="utf-8") as fp:
+            fp.write(msg + "\n")
+    except OSError:
+        pass
+
+
 def run_fetch_game(target, ref=None):
     """命令行补齐游戏文件（无界面，便于自检/排错）"""
     cfg = load_config()
     path, err = validate_game_dir(target)
     if err:
         print(f"[路径不可用] {err}")
+        _early_fetch_log(f"[路径不可用] {err}")
         return 2
-    print(f"目标目录：{path}")
+    log_path = path / "launcher_fetch.log"
+    log_file = None
+    try:
+        log_file = open(log_path, "w", encoding="utf-8")
+    except OSError:
+        log_file = None
+
+    def say(msg):
+        print(msg)
+        if log_file:
+            try:
+                log_file.write(msg + "\n")
+                log_file.flush()
+            except OSError:
+                pass
+
+    say(f"目标目录：{path}")
+    entry = path / GAME_ENTRY_NAME
     try:
         info = fetch_game_files(
             path, ref=ref or resolve_source_ref(cfg), cfg=cfg,
-            on_progress=lambda d, t, m: print(f"  {m}"),
-            on_log=lambda m: print(m),
+            on_progress=lambda d, t, m: say(f"  {m}"),
+            on_log=say,
         )
+        ok = entry.is_file()
+        size = entry.stat().st_size if ok else 0
+        say(f"完成：{info['files']} 个文件，{info['bytes'] / 1048576:.1f} MB")
+        say(f"{GAME_ENTRY_NAME} 存在：{ok}（{size} B）")
     except GameDownloadError as exc:
-        print(f"[下载失败] {exc}")
+        say(f"[下载失败] {exc}")
         return 3
-    entry = path / GAME_ENTRY_NAME
-    print(f"完成：{info['files']} 个文件，{info['bytes'] / 1048576:.1f} MB")
-    print(f"{GAME_ENTRY_NAME} 存在：{entry.is_file()}（{entry.stat().st_size if entry.is_file() else 0} B）")
+    finally:
+        if log_file:
+            try:
+                log_file.close()
+            except OSError:
+                pass
     return 0 if entry.is_file() else 4
 
 
