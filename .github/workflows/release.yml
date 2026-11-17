@@ -1,7 +1,7 @@
 name: release
 
-# 推 v* 标签时自动构建 Windows exe 并附到 Release；
-# 也可在 Actions 页面手动 Run workflow（仅构建，不发布）。
+# 推 v* 标签或手动 Run workflow 时，构建 Windows exe 并作为构建产物上传（不改动 Release）。
+# Release 资产由维护者手工发布，避免 CI 覆盖已写好的更新说明。
 on:
   push:
     tags:
@@ -29,7 +29,8 @@ jobs:
       - name: Build launcher exe
         run: |
           pyinstaller --noconfirm --onefile --windowed --name "射击启动器" `
-            --icon "assets/icon.ico" --distpath dist --workpath build --specpath build `
+            --icon "${{ github.workspace }}/assets/icon.ico" `
+            --distpath dist --workpath build --specpath build `
             --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets `
             --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick `
             --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtMultimedia `
@@ -39,21 +40,16 @@ jobs:
       - name: Smoke test (compile)
         run: python -m py_compile app_style.py room_net.py net_ui.py launcher.py 射击.py
 
+      - name: Normalize artifact name
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\*.exe | ForEach-Object {
+            $target = "dist\ursina-shooter-launcher-$env:GITHUB_REF_NAME.exe"
+            Move-Item -LiteralPath $_.FullName -Destination $target -Force
+            Get-Item -LiteralPath $target | Select-Object Name, Length
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: shooting-launcher
           path: dist/*.exe
-
-      - name: Publish to Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.exe
-          generate_release_notes: true
-          body: |
-            射击启动器（Windows x64，单文件免安装）
-
-            运行前提：本机已安装 Python 3.11 / 3.12 且装了 ursina；
-            或在启动器里点「修复环境」自动创建虚拟环境。
-
-            许可证：PolyForm Noncommercial 1.0.0（仅限非商业用途）。
