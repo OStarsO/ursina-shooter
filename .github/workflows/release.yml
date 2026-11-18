@@ -37,8 +37,12 @@ jobs:
             --exclude-module PySide6.QtCharts --exclude-module PySide6.QtPdf `
             --exclude-module tkinter launcher.py
 
+      - name: Build game exe (onedir, 资源随包)
+        run: |
+          pyinstaller --noconfirm --distpath dist_game --workpath build_game 射击.spec
+
       - name: Smoke test (compile)
-        run: python -m py_compile app_style.py room_net.py net_ui.py launcher.py 射击.py
+        run: python -m py_compile app_style.py room_net.py net_ui.py launcher.py 射击.py updater.py
 
       - name: Normalize artifact name
         shell: pwsh
@@ -48,8 +52,13 @@ jobs:
             Move-Item -LiteralPath $_.FullName -Destination $target -Force
             Get-Item -LiteralPath $target | Select-Object Name, Length
           }
+          $gameZip = "dist\ursina-shooter-game-$env:GITHUB_REF_NAME.zip"
+          Compress-Archive -Path "dist_game\射击\*" -DestinationPath $gameZip -Force
+          Get-Item -LiteralPath $gameZip | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: shooting-launcher
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.zip

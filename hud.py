@@ -41,6 +41,7 @@ class Crosshair:
         self.base_gap = gap if gap is not None else px(7)
         self.spread = 0.0
         self.col = col
+        self._base_thickness = thickness if thickness is not None else px(2.4)
 
         self.h = []
         self.v = []
@@ -118,6 +119,25 @@ class Crosshair:
             m.color = rgba((255, 92, 72), 255)
         for o in self.mark_outlines:
             o.color = rgba((0, 0, 0), 150)
+
+    STYLES = ('cross', 'dot', 't', 'thick')
+
+    def set_style(self, style):
+        """准星样式：cross 十字 / dot 圆点 / t 形 / thick 粗十字。"""
+        self.style = style if style in self.STYLES else 'cross'
+        s = self.style
+        for outline, line, sign in self.h:
+            outline.enabled = line.enabled = s in ('cross', 't', 'thick')
+        for outline, line, sign in self.v:
+            on = s in ('cross', 'thick') or (s == 't' and sign == -1)
+            outline.enabled = line.enabled = on
+        base = getattr(self, '_base_thickness', self.thickness)
+        self.thickness = base * (1.7 if s == 'thick' else 1.0)
+        if self.dot is not None:
+            self.dot.enabled = s in ('cross', 'dot', 'thick')
+            k = 2.2 if s == 'dot' else 1.6
+            self.dot.scale = (self.thickness * k, self.thickness * k)
+        self._apply()
 
     def damage(self, angle_deg):
         self.dmg_t = 1.1
@@ -522,6 +542,10 @@ class HUD:
         self.room_label.x = -ui_half_w() + px(PAD) + px(4)
         self.room_label.y = self.radar.root.y - self.radar.size / 2 - px(12)
         self.room_label.origin = (-0.5, 0)
+
+    def set_crosshair(self, style):
+        """准星样式（cross / dot / t / thick），设置页即时切换。"""
+        self.crosshair.set_style(style)
 
     def set_weapon(self, weapon, kind='gun'):
         """切换到另一把武器（枪 / 近战），同步右下角弹药面板与准星。"""

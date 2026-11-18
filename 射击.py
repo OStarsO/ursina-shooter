@@ -17,25 +17,43 @@ import os
 import random
 import sys as _sys
 
+# ===================== 冻结态（PyInstaller 打包）路径 =====================
+# 打包后 exe 是窗口程序，stdout/stderr 为 None，print 会抛异常 → 兜底到空设备
+if getattr(_sys, 'stdout', None) is None:
+    _sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if getattr(_sys, 'stderr', None) is None:
+    _sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
+FROZEN = bool(getattr(_sys, 'frozen', False))
+if FROZEN:
+    # 资源（模型/贴图/字体/音效/地图）在 _MEIPASS（onedir 下为 _internal）；
+    # 存档类（settings/scores）落在 exe 同级目录，可持久化、不被清理。
+    BASE_DIR = os.path.dirname(os.path.abspath(_sys.executable))
+    RES_DIR = getattr(_sys, '_MEIPASS', BASE_DIR)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    RES_DIR = BASE_DIR
+
+# 字体与贴图都用相对路径加载（Panda3D 对含中文的绝对路径不友好），
+# 所以把工作目录切到资源根（源码运行 = 游戏目录；打包运行 = 资源解压目录）。
+try:
+    os.chdir(RES_DIR)
+except OSError:
+    pass
+
 from panda3d.core import ClockObject, Filename
 from ursina import *
 from ursina.prefabs.first_person_controller import FirstPersonController
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 字体与贴图都用相对路径加载（Panda3D 对含中文的绝对路径不友好），
-# 启动器已经把工作目录设成游戏目录，这里再兜底一次。
-try:
-    os.chdir(BASE_DIR)
-except OSError:
-    pass
 
 import ui_theme as T
 from ui_theme import px
 import hud as HUD_MODULE
 import menu as MENU
 import arena as ARENA
+import cover_map
 import dummies as DUMMY_MODULE
 import bots as BOTS_MODULE
+import remote_actors as REMOTE
 import winfix
 import shop as SHOP_MODULE
 from combat import (Player, Weapon, Melee, ZONE_MULTIPLIERS, zone_damage,
@@ -99,6 +117,19 @@ SHOT_PATH, SHOT_VIEW, SHOT_SIZE = parse_shot_args()
 SELFTEST = '--selftest' in _sys.argv[1:]
 
 
+def parse_selftest_log(argv=None):
+    """--selftest-log <path>：把自检结果写入文件（打包成窗口 exe 后看不到控制台）。"""
+    argv = list(_sys.argv[1:] if argv is None else argv)
+    for i, a in enumerate(argv):
+        if a == '--selftest-log' and i + 1 < len(argv):
+            path = argv[i + 1]
+            return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+    return None
+
+
+SELFTEST_LOG = parse_selftest_log()
+
+
 def parse_map_arg(argv=None):
     """自检/截图用：--map duel 指定加载单挑竞技场。"""
     argv = list(_sys.argv[1:] if argv is None else argv)
@@ -132,7 +163,19 @@ DEFAULT_SETTINGS = {
     'window_height': 900,
     'fullscreen': False,
     'sensitivity': 40.0,
-    'volume': 1.0,
+    'volume': 1.0,          # 主音量
+    'volume_sfx': 1.0,      # 音效
+    'volume_ui': 1.0,       # 界面提示音
+    'crosshair': 'cross',   # cross / dot / t / thick
+    'quality': 'medium',    # low / medium / high
+    'resolution': '',       # '1600x900'；空 = 用 window_width/height
+    'killcam': False,       # 死亡后镜头切到击杀者
+    'keymap': {},           # 自定义键位（动作 -> 键名）
+}
+
+KEYMAP_DEFAULT = {
+    'reload': 'r', 'shop': 'b', 'inspect': 'f',
+    'third': 'v', 'scoreboard': 'tab', 'pause': 'escape',
 }
 
 
@@ -143,15 +186,32 @@ def load_settings():
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, dict):
-            for key in settings:
-                if key in data and isinstance(data[key], (int, float, bool)):
+            for key in ('window_width', 'window_height', 'sensitivity', 'volume',
+                        'volume_sfx', 'volume_ui'):
+                if isinstance(data.get(key), (int, float)) and not isinstance(
+                        data.get(key), bool):
                     settings[key] = data[key]
+            settings['fullscreen'] = bool(data.get('fullscreen', False))
+            settings['killcam'] = bool(data.get('killcam', False))
+            for key, allowed in (('crosshair', ('cross', 'dot', 't', 'thick')),
+                                 ('quality', ('low', 'medium', 'high'))):
+                val = data.get(key)
+                if isinstance(val, str) and val in allowed:
+                    settings[key] = val
+            res = data.get('resolution')
+            if isinstance(res, str) and 'x' in res:
+                settings['resolution'] = res
+            km = data.get('keymap')
+            if isinstance(km, dict):
+                settings['keymap'] = {str(k): str(v) for k, v in km.items()
+                                      if isinstance(v, str) and v}
     except (OSError, ValueError):
         pass
     settings['window_width'] = int(max(800, min(3840, settings['window_width'])))
     settings['window_height'] = int(max(600, min(2160, settings['window_height'])))
     settings['sensitivity'] = float(max(5, min(200, settings['sensitivity'])))
-    settings['volume'] = float(max(0.0, min(1.0, settings['volume'])))
+    for key in ('volume', 'volume_sfx', 'volume_ui'):
+        settings[key] = float(max(0.0, min(1.0, settings[key])))
     return settings
 
 
@@ -185,6 +245,9 @@ def save_score(current_score):
 
 
 SETTINGS = load_settings()
+KEYMAP = dict(KEYMAP_DEFAULT)
+KEYMAP.update({k: v for k, v in (SETTINGS.get('keymap') or {}).items()
+               if isinstance(v, str) and v})
 if not SHOT_PATH:                       # 出图时分辨率已固定，不要再 resize
     window.fullscreen = bool(SETTINGS['fullscreen'])
     if not SETTINGS['fullscreen']:
@@ -259,7 +322,9 @@ NICKNAME = NET_INFO.get('nickname') or '玩家'
 # maps/LICENSES.md）——这张图同时兼任 1v1 与团队对战地图
 DUEL = bool(NET_INFO.get('mode') == 'duel' or MAP_ARG == 'duel')
 TEAM = bool(NET_INFO.get('mode') in ('team5', 'team10') or MAP_ARG == 'team')
-duel_arena = ARENA.load() if (DUEL or TEAM) else None
+# 掩体地图（cube 拼装，纯代码生成）：单挑/团队共用；服务端 netsim 使用同一份
+# AABB 几何（cover_map.OBSTACLES），弹道判定两边一致。
+duel_arena = cover_map.load() if (DUEL or TEAM) else None
 if duel_arena is None:
     DUEL = TEAM = False
 if DUEL:
@@ -269,8 +334,8 @@ elif TEAM:
 
 # 目标刷新范围：训练场开阔 / 地图收进墙内
 if duel_arena is not None:
-    AREA = ARENA.TARGET_AREA
-    Y_MAX = ARENA.TARGET_Y_MAX
+    AREA = cover_map.TARGET_AREA
+    Y_MAX = cover_map.TARGET_Y_MAX
 else:
     AREA = (-22, 22, -22, 22)
     Y_MAX = 7
@@ -298,7 +363,8 @@ _char_current_anim = None
 
 try:
     from direct.actor.Actor import Actor as PandaActor
-    _char_actor = PandaActor('characters/soldier.glb')
+    # 优先 BAM（打包后更稳，见 bots.py 中 CHAR_MODEL 的说明），缺失时回退 GLB
+    _char_actor = PandaActor(BOTS_MODULE.CHAR_MODEL)
     _char_actor.reparentTo(player)
     # 归一化身高到 1.8 米，脚底贴玩家原点（FPC 原点在脚）
     _mn, _mx = _char_actor.getTightBounds()
@@ -381,18 +447,19 @@ ENEMY_TEAM = 'blue' if MY_TEAM == 'red' else 'red'
 
 
 def _bot_hit_player(dmg, zone, bot):
-    """人机命中玩家：三区倍率已在 bots 侧结算，这里扣血 + 受击方向 + 击杀提示。"""
+    """人机命中玩家（单机/本地模式）。联机由服务端权威结算，不走这里。"""
     global blue_score, match_won
-    if not state.alive:
+    if not state.alive or god_mode:
         return
     dx = bot.root.world_position.x - player.world_position.x
     dz = bot.root.world_position.z - player.world_position.z
     ang = math.degrees(math.atan2(dx, dz)) - player.rotation_y
-    state.take_damage(dmg)
+    state.take_damage(dmg * damage_mult)
+    state.last_damage = int(dmg * damage_mult)
+    last_hit.update({'killer': bot.name, 'weapon': bot.weapon_key,
+                     'zone': zone, 'damage': dmg * damage_mult, 'cause': '击杀',
+                     'pos': tuple(bot.root.world_position)})
     hud.on_damage(ang)
-    # 联机：被人机击中的声明上报（target = 自己，允许的代报路径）
-    if game_net is not None and bot.member_id and MY_MEMBER_ID is not None:
-        game_net.hit_claim(bot.member_id, MY_MEMBER_ID, bot.weapon_key, zone)
     if not state.alive:
         blue_score += 10
         hud.push_kill(f'{NICKNAME}（{ZONE_CN[zone]}）', 0, killer=bot.name)
@@ -404,28 +471,10 @@ def _bot_hit_player(dmg, zone, bot):
 
 
 def _spawn_bots():
-    """按房间配置 / 本地模式生成人机。"""
-    positions = []
-    difficulty_default = 'normal'
+    """生成人机：单机模式本地 AI；联机模式由服务端 netsim 模拟（快照渲染）。"""
     if NET_INFO.get('net-mode'):
-        # 联机：房间成员里 is_bot 且属于敌方阵营的成员 → 生成对应难度人机
-        for p in NET_INFO.get('players') or []:
-            if not isinstance(p, dict) or not p.get('is_bot'):
-                continue
-            if p.get('team') != ENEMY_TEAM:
-                continue
-            pos, yaw = (duel_arena.spawn_team(ENEMY_TEAM, len(positions))
-                        if duel_arena else ((0, 2, 20 + len(positions) * 3), 0))
-            _bot = BOTS_MODULE.Bot(
-                name=p.get('nickname') or p.get('name') or 'BOT',
-                team=ENEMY_TEAM,
-                difficulty=p.get('difficulty') or difficulty_default,
-                position=pos, heading=yaw,
-                fire_audio=bot_fire_sound,
-                on_hit_player=_bot_hit_player)
-            _bot.member_id = p.get('id')
-            bots.append(_bot)
-    elif TEAM and duel_arena:
+        return                        # 服务端机器人 → 客户端只渲染快照
+    if TEAM and duel_arena:
         # 本地团队：蓝队 3 人机（普通）占蓝队出生点
         for i in range(3):
             pos, yaw = duel_arena.spawn_team('blue', i)
@@ -566,22 +615,87 @@ if NET_INFO.get('net-mode'):
 paused = False
 
 
+def _apply_volumes():
+    """音量分轨：主音量 × 音效 / 界面（各一条总线）。"""
+    master = float(SETTINGS.get('volume', 1.0))
+    sfx = float(SETTINGS.get('volume_sfx', 1.0))
+    ui = float(SETTINGS.get('volume_ui', 1.0))
+    for _snd in list(FIRE_SOUNDS.values()) + [reload_sound, reload_done_sound,
+                                              switch_gun_sound, switch_knife_sound]:
+        if _snd is not None:
+            try:
+                _snd.volume = max(0.0, min(1.0, master * sfx)) * 0.9
+            except Exception:  # noqa: BLE001
+                pass
+    if hit_sound is not None:
+        try:
+            hit_sound.volume = max(0.0, min(1.0, master * ui)) * 0.9
+        except Exception:  # noqa: BLE001
+            pass
+    if bot_fire_sound is not None:
+        try:
+            bot_fire_sound.volume = max(0.0, min(1.0, master * sfx)) * 0.5
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def apply_quality(level):
+    """画质档位：可视距离 + 毛玻璃（低档关闭玻璃层，省一次全屏渲染）。"""
+    far = {'low': 90, 'medium': 180, 'high': 320}.get(level, 180)
+    try:
+        camera.clip_plane_far = far
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import glass as _glass
+        _glass.ENABLED = level != 'low'
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def apply_resolution(text):
+    """分辨率即时生效（改 window.size；HUD 每帧检测比例自动重排）。"""
+    try:
+        tw, th = (int(v) for v in str(text).lower().split('x'))
+    except (ValueError, TypeError):
+        return
+    if tw < 800 or th < 600:
+        return
+    SETTINGS['window_width'] = tw
+    SETTINGS['window_height'] = th
+    if not SETTINGS.get('fullscreen'):
+        try:
+            window.size = (tw, th)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def apply_setting(key, value):
     """设置项立即生效并写回 settings.json（启动器也读这个文件）。"""
     SETTINGS[key] = value
     if key == 'sensitivity':
         player.mouse_sensitivity = Vec2(float(value), float(value))
-    elif key == 'volume':
-        for _snd in list(FIRE_SOUNDS.values()) + [
-                bot_fire_sound, hit_sound, reload_sound, reload_done_sound,
-                switch_gun_sound, switch_knife_sound]:
-            if _snd is not None:
-                try:
-                    _snd.volume = float(value) * (0.5 if _snd is bot_fire_sound else 0.9)
-                except Exception:
-                    pass
+    elif key in ('volume', 'volume_sfx', 'volume_ui'):
+        _apply_volumes()
     elif key == 'fullscreen':
         window.fullscreen = bool(value)
+    elif key == 'crosshair':
+        hud.set_crosshair(value)
+    elif key == 'quality':
+        apply_quality(value)
+    elif key == 'resolution':
+        apply_resolution(value)
+    save_settings()
+
+
+def on_keybind(action, key):
+    """暂停菜单改键回调：写入 KEYMAP + settings.json。"""
+    if key:
+        KEYMAP[action] = key
+        SETTINGS.setdefault('keymap', {})[action] = key
+    else:
+        KEYMAP[action] = KEYMAP_DEFAULT.get(action, '')
+        SETTINGS.setdefault('keymap', {}).pop(action, None)
     save_settings()
 
 
@@ -610,8 +724,265 @@ def _score_rows():
 
 pause_menu = MENU.PauseMenu(settings=SETTINGS, on_resume=lambda: toggle_pause(False),
                             on_quit=lambda: application.quit(),
-                            on_setting=apply_setting, stats_provider=_stats)
+                            on_setting=apply_setting, stats_provider=_stats,
+                            on_keybind=on_keybind)
 scoreboard = MENU.Scoreboard(provider=_score_rows)
+death_panel = MENU.DeathPanel()
+results_page = MENU.ResultsPage(on_leave=lambda: application.quit())
+
+# 初始应用设置（准星样式 / 画质 / 音量分轨 / 分辨率）
+try:
+    hud.set_crosshair(SETTINGS.get('crosshair', 'cross'))
+    apply_quality(SETTINGS.get('quality', 'medium'))
+    _apply_volumes()
+    if SETTINGS.get('resolution'):
+        apply_resolution(SETTINGS['resolution'])
+except Exception as _exc:  # noqa: BLE001
+    print('[设置] 初始应用失败:', _exc)
+
+
+# ===================== 对局流程（单机 / 联机共用） =====================
+match_time_limit = 300.0        # 单机一局时长（秒）；联机由服务端计时
+match_elapsed = 0.0
+match_ended = False
+god_mode = False                # 房主 god 指令（单机/客户端侧伤害免疫）
+damage_mult = 1.0               # 房主 damage 指令（单机假人伤害倍数）
+ammo_inf = False                # 房主 ammo inf（打空自动补满弹匣）
+last_hit = {}                   # 最近一次受击：killer/weapon/zone/damage/cause/pos
+killcam_pos = None              # 死亡镜头看向的世界坐标
+killcam_name = ''
+_death_shown = -1               # 已展示死亡面板的死亡序号（state.deaths）
+remote_world = REMOTE.RemoteWorld() if NET_INFO.get('net-mode') else None
+
+
+def _weapon_cn(key):
+    spec = WEAPON_CATALOG.get(key) or {}
+    return spec.get('name') or key or '未知'
+
+
+def _reset_camera():
+    """死亡镜头/第三人称之后把相机恢复到第一人称。"""
+    global killcam_pos, killcam_name
+    killcam_pos = None
+    killcam_name = ''
+    try:
+        camera.position = Vec3(0, 0, 0)
+        camera.rotation = Vec3(0, 0, 0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _show_death_panel():
+    info = last_hit or {}
+    death_panel.show_death(
+        killer=info.get('killer') or '未知',
+        weapon=info.get('weapon_cn') or _weapon_cn(info.get('weapon')),
+        zone=info.get('zone') or '',
+        damage=info.get('damage') or 0,
+        respawn=state.death_time,
+        killcam=bool(SETTINGS.get('killcam')),
+        cause=info.get('cause') or '击杀',
+    )
+
+
+def _killcam_view(dt):
+    """死亡后可选：把镜头切到击杀者身后（设置 killcam 开启时）。"""
+    if not SETTINGS.get('killcam') or state.alive or killcam_pos is None:
+        return
+    try:
+        kx, ky, kz = killcam_pos
+        px_, pz_ = player.world_position.x, player.world_position.z
+        dx, dz = kx - px_, kz - pz_
+        d = math.hypot(dx, dz) or 1.0
+        eye = Vec3(kx - dx / d * 2.6, ky + 1.75, kz - dz / d * 2.6)
+        camera.world_position = eye
+        camera.look_at(Vec3(kx, ky + 1.2, kz))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reset_match(game=None):
+    """收到 start（房主重开/晚加入）时复位本局状态。"""
+    global match_ended, match_elapsed, god_mode, damage_mult, ammo_inf, blue_score
+    match_ended = False
+    match_elapsed = 0.0
+    god_mode = False
+    damage_mult = 1.0
+    ammo_inf = False
+    blue_score = 0
+    state.score = 0
+    state.kills = 0
+    state.deaths = 0
+    results_page.hide()
+    death_panel.hide()
+    if not state.alive:
+        state.respawn(full_armor=True)
+    player.enabled = True
+    mouse.locked = True
+    mouse.visible = False
+    hud.banner('对局开始', 1.6, T.C_OK)
+
+
+def end_match(result, reason='time'):
+    """回合结束：冻结操作 + 弹出结算页（单机与联机共用同一套 UI）。"""
+    global match_ended
+    if match_ended:
+        return
+    match_ended = True
+    death_panel.hide()
+    player.enabled = False
+    mouse.locked = False
+    mouse.visible = True
+    if result is None:
+        red = state.score if TEAM else state.score
+        blue = blue_score
+        rows = [{'name': NICKNAME, 'team': 'red' if TEAM else 'T',
+                 'kills': state.kills, 'deaths': state.deaths, 'assists': 0,
+                 'score': red}]
+        result = {'reason': reason, 'score': {'red': red, 'blue': blue},
+                  'rows': rows,
+                  'winner': ('red' if red > blue else 'blue' if blue > red else ''),
+                  'mvp': {'name': NICKNAME, 'team': 'red', 'score': red}}
+    results_page.show_result(result)
+    hud.banner('对局结束', 2.0, T.C_ACCENT)
+
+
+def _end_if_needed():
+    """单机胜负：达到目标比分或计时归零 → 结算（联机由服务端下发 result）。"""
+    global match_elapsed
+    if match_ended or NET_INFO.get('net-mode'):
+        return
+    match_elapsed += time.dt
+    if match_time_limit and match_elapsed >= match_time_limit:
+        end_match(None, 'time')
+        return
+    if TEAM and VICTORY:
+        if state.score >= VICTORY:
+            end_match(None, 'score')
+        elif blue_score >= VICTORY:
+            end_match({'reason': 'score', 'winner': 'blue',
+                       'score': {'red': state.score, 'blue': blue_score},
+                       'rows': [{'name': NICKNAME, 'team': 'red',
+                                 'kills': state.kills, 'deaths': state.deaths,
+                                 'assists': 0, 'score': state.score}],
+                       'mvp': {'name': 'BOT', 'team': 'blue',
+                               'score': blue_score}}, 'score')
+
+
+def _apply_cmd(cmd):
+    """房主作弊指令：god / speed / damage / ammo_inf / kill / tp / respawn。"""
+    global god_mode, damage_mult, ammo_inf
+    if not isinstance(cmd, dict):
+        return
+    name = cmd.get('name')
+    target = cmd.get('target')
+    names = target if isinstance(target, list) else ([target] if target else [])
+    affects_me = (not names) or (NICKNAME in names) or ('all' in names)
+    if name == 'god':
+        if affects_me:
+            god_mode = bool(cmd.get('value', True))
+            hud.banner(f'无敌：{"开" if god_mode else "关"}', 1.4, T.C_WARN)
+    elif name == 'speed':
+        if affects_me:
+            player.speed = 8.0 * float(cmd.get('value', 1.0))
+            hud.banner(f'移动速度 ×{float(cmd.get("value", 1.0)):g}', 1.4, T.C_WARN)
+    elif name == 'damage':
+        damage_mult = float(cmd.get('value', 1.0))
+        hud.banner(f'伤害倍数 ×{damage_mult:g}', 1.4, T.C_WARN)
+    elif name == 'ammo_inf':
+        ammo_inf = bool(cmd.get('value', True))
+        hud.banner(f'无限弹药：{"开" if ammo_inf else "关"}', 1.4, T.C_WARN)
+    elif name == 'respawn':
+        state.respawn_delay = float(cmd.get('value', 3))
+        hud.banner(f'重生时间 {state.respawn_delay:.0f}s', 1.4, T.C_WARN)
+    elif name == 'kill' and affects_me:
+        state.take_damage(99999, ignore_armor=True)
+    elif name == 'tp' and affects_me:
+        try:
+            player.position = (float(cmd.get('x', 0)), 1.6, float(cmd.get('z', 0)))
+            hud.banner('已被房主传送', 1.4, T.C_WARN)
+        except (TypeError, ValueError):
+            pass
+
+
+def _handle_net_event(ev):
+    """服务端事件：命中/击杀/复活/无敌挡伤 → 表现层反馈。"""
+    if not isinstance(ev, dict):
+        return
+    kind = ev.get('t')
+    me = MY_MEMBER_ID
+    if kind == 'hit':
+        if ev.get('attacker') == me:
+            if hit_sound:
+                hit_sound.play()
+            hud.on_fire(hit=True)
+        if ev.get('victim') == me:
+            pos = ev.get('pos')
+            ang = random.uniform(-30, 30)
+            if pos:
+                try:
+                    ang = math.degrees(math.atan2(float(pos[0]) - player.x,
+                                                  float(pos[2]) - player.z)) - player.rotation_y
+                except (TypeError, ValueError, IndexError):
+                    pass
+            last_hit.update({'killer': ev.get('killer_name') or '人机',
+                             'weapon': ev.get('weapon'), 'zone': ev.get('zone'),
+                             'damage': ev.get('damage'), 'cause': '击杀'})
+            hud.on_damage(ang)
+    elif kind == 'kill':
+        victim = ev.get('victim')
+        zone_cn = ZONE_CN.get(ev.get('zone'), '')
+        if ev.get('killer') == me:
+            hud.push_kill(f'{ev.get("victim_name", "目标")}（{zone_cn}）', 10)
+            hud.on_fire(hit=True, kill=True)
+        if victim == me:
+            last_hit.update({
+                'killer': ev.get('killer_name') or '人机',
+                'weapon': ev.get('weapon'), 'zone': ev.get('zone'),
+                'damage': 100, 'cause': '击杀',
+            })
+            if state.alive:
+                state.die()
+    elif kind == 'blocked':
+        if ev.get('victim') == me:
+            hud.banner('无敌：已挡下伤害', 1.0, T.C_WARN)
+    elif kind == 'respawn' and ev.get('id') == me:
+        if not state.alive:
+            respawn_player()
+    elif kind == 'bot_shot' and ev.get('hit'):
+        pass
+
+
+def _apply_snapshot(msg, dt):
+    """消费服务端快照：自身血量/战绩以服务器为准，其他人由 RemoteWorld 渲染。"""
+    global blue_score
+    ents = msg.get('entities') or []
+    mine = None
+    for e in ents:
+        if e.get('id') == MY_MEMBER_ID:
+            mine = e
+            break
+    if mine is not None:
+        hp = int(mine.get('hp', state.health))
+        if hp != int(state.health):
+            state.health = hp
+            state.damage_flash = 1.0
+        if mine.get('alive') and not state.alive and state.death_time <= 0:
+            respawn_player()                     # 服务端已复活
+        elif (not mine.get('alive')) and state.alive:
+            state.die()
+        state.score = int(mine.get('score', state.score))
+        state.kills = int(mine.get('kills', state.kills))
+        state.deaths = int(mine.get('deaths', state.deaths))
+    if remote_world is not None:
+        remote_world.update(ents, MY_MEMBER_ID, dt)
+    score = msg.get('score') or {}
+    enemy = 'blue' if MY_TEAM == 'red' else 'red'
+    blue_score = int(score.get(enemy, blue_score))
+    for ev in msg.get('events') or []:
+        _handle_net_event(ev)
+    if msg.get('result'):
+        end_match(msg['result'])
 
 
 def toggle_pause(force=None):
@@ -766,30 +1137,37 @@ def hit_bot(bot, hit_point, base_damage):
 
 
 def swing_knife():
-    """近战：短距离射线，按刀伤害结算。"""
-    if not weapon.fire():
+    """近战：短距离射线，按刀伤害结算（联机同样上报服务端判定）。"""
+    if match_ended or not weapon.fire():
         return
     viewmodel.swing_anim()
     _snd = FIRE_SOUNDS.get('knife')
     if _snd is not None:
         _snd.play()
+    if game_net is not None:
+        game_net.send_fire(camera.world_position, camera.forward)
+        return
     hit_info = raycast(camera.world_position, camera.forward, distance=weapon.reach)
     if hit_info.hit:
         _ent = hit_info.entity
         _dummy = getattr(_ent, 'dummy', None)
         _bot = getattr(_ent, 'bot_ref', None)
         if _bot is not None:
-            hit_bot(_bot, hit_info.world_point, weapon.damage)
+            hit_bot(_bot, hit_info.world_point, weapon.damage * damage_mult)
         elif _dummy is not None and _dummy.alive:
-            hit_dummy(_dummy, _ent, weapon.damage)
+            hit_dummy(_dummy, _ent, weapon.damage * damage_mult)
         elif _dummy is None and _bot is None and _ent in targets:
-            hit_target(_ent, weapon.damage)
+            hit_target(_ent, weapon.damage * damage_mult)
 
 
 def try_fire():
-    """开火入口：半自动靠 fire_latch 锁住，弹道带每武器散布与后坐力。"""
+    """开火入口：半自动靠 fire_latch 锁住，弹道带每武器散布与后坐力。
+
+    联机模式下命中/伤害由服务端权威结算（这里只上报开火起点与方向）；
+    单机模式仍在本地做射线判定。
+    """
     global fire_latch, recoil_pitch, recoil_yaw
-    if paused or not state.alive or viewmodel.busy:
+    if paused or match_ended or not state.alive or viewmodel.busy:
         return
 
     if viewmodel.kind == 'melee':
@@ -807,6 +1185,8 @@ def try_fire():
     if not weapon.fire():
         return
     fire_latch = True
+    if ammo_inf:                            # 房主 ammo inf：弹匣不消耗
+        weapon.mag = weapon.mag_size
 
     spec = viewmodel.spec
     viewmodel.fire_anim(spec.get('recoil', {}).get('vm', 1.0))
@@ -826,19 +1206,24 @@ def try_fire():
     # 准星随散布张开（读得出精度状态）
     hud.crosshair.fire(px(1.6 + deg * 1.05), px(9.0 + sp.get('max', 5.0) * 2.2))
 
+    # 联机：上报开火（服务端弹道判定 + 射速校验），本地不再结算伤害
+    if game_net is not None:
+        game_net.send_fire(camera.world_position, direction)
+        return
+
     hit_info = raycast(camera.world_position, direction, distance=100)
     if hit_info.hit:
         _ent = hit_info.entity
         _dummy = getattr(_ent, 'dummy', None)
         _bot = getattr(_ent, 'bot_ref', None)
         if _bot is not None:
-            hit_bot(_bot, hit_info.world_point, weapon.damage)
+            hit_bot(_bot, hit_info.world_point, weapon.damage * damage_mult)
         elif _dummy is not None:
             if _dummy.alive:
-                hit_dummy(_dummy, _ent, weapon.damage)
+                hit_dummy(_dummy, _ent, weapon.damage * damage_mult)
             # 已倒地的木偶不重复结算，也不触发"打墙"反馈
         elif _ent in targets:
-            hit_target(_ent, weapon.damage)
+            hit_target(_ent, weapon.damage * damage_mult)
         else:
             # 打在世界物体上：同样给红色受击标记闪现 + 命中音（无伤害）
             hud.on_fire(hit=True)
@@ -908,9 +1293,15 @@ def respawn_player():
     hud.banner('重生', 1.1, T.C_OK)
     mouse.locked = True
     mouse.visible = False
+    _reset_camera()
 
 
 peak_y = 0.0
+
+
+def _act(key, action, suffix=''):
+    """按键是否命中某动作（支持自定义键位；suffix 用于 ' up' 之类）。"""
+    return key == (KEYMAP.get(action) or KEYMAP_DEFAULT.get(action, '')) + suffix
 
 
 def input(key):
@@ -919,7 +1310,17 @@ def input(key):
     # （就是"手枪只能开一枪"的根因）。
     global fire_latch
 
-    if key == 'escape':
+    # 结算页：只允许返回
+    if results_page.visible:
+        if key in ('escape', 'enter'):
+            results_page._leave()
+        return
+
+    # 改键等待：吃掉当前按键并完成绑定
+    if pause_menu.capture_key(key):
+        return
+
+    if _act(key, 'pause'):
         if shop.visible:               # 商店开着先关商店
             close_shop()
             return
@@ -932,7 +1333,7 @@ def input(key):
         return
 
     if shop.visible:
-        if key == 'b':
+        if _act(key, 'shop'):
             close_shop()
         return
 
@@ -946,18 +1347,18 @@ def input(key):
     if key == 'left mouse up':
         fire_latch = False
 
-    if key == 'tab':
+    if _act(key, 'scoreboard'):
         scoreboard.show()
         mouse.locked = False
         mouse.visible = True
         return
-    if key == 'tab up':
+    if _act(key, 'scoreboard', ' up'):
         scoreboard.hide()
         mouse.locked = state.alive
         mouse.visible = not state.alive
         return
 
-    if key == 'r':
+    if _act(key, 'reload'):
         start_reload()
 
     # 配装切枪：1=主武器 2=副武器 3=匕首（只切已装备的，滚轮在装备内循环）
@@ -977,12 +1378,12 @@ def input(key):
     if key == 'right mouse up':
         set_scope(False)
 
-    if key == 'b':
+    if _act(key, 'shop'):
         open_shop()
-    if key == 'v':
+    if _act(key, 'third'):
         toggle_third_person()
 
-    if key == 'f':
+    if _act(key, 'inspect'):
         # 检视中再按一次 = 提前收枪（start_inspect 内部处理打断）
         viewmodel.start_inspect()
     if key == 'f1':
@@ -996,11 +1397,13 @@ def input(key):
 # ===================== 主循环 =====================
 def update():
     global peak_y, fire_latch, recoil_pitch, recoil_yaw, scoping
-    global _prev_reloading, blue_score
+    global _prev_reloading, blue_score, _death_shown, killcam_pos
 
     dt = time.dt
-    if paused:
+    if paused or match_ended:
         return
+    if not SHOT_PATH:                  # 出图模式注入了演示数据，不自动结算
+        _end_if_needed()
 
     # ---- 后坐力回落：把开火时踢上去的视角按武器速度收回来 ----
     # 开火是 rotation_x -= kick（向上），回落就加回来
@@ -1052,29 +1455,59 @@ def update():
     if held_keys['left mouse']:
         try_fire()
 
-    # 摔落伤害
+    # 摔落伤害（god 免伤）
     if not player.grounded:
         peak_y = max(peak_y, player.y)
     else:
         drop = peak_y - player.y
-        if drop > 5.0 and state.alive:
+        if drop > 5.0 and state.alive and not god_mode:
             dmg = (drop - 5.0) * 6
-            state.take_damage(dmg, ignore_armor=True)
+            state.take_damage(dmg * damage_mult, ignore_armor=True)
+            last_hit.update({'killer': '坠落', 'weapon': '', 'zone': 'limb',
+                             'damage': dmg, 'cause': '坠落伤害'})
             hud.on_damage(180)
             hud.banner(f'坠落 -{int(dmg)}', 1.0, T.C_DANGER)
         peak_y = player.y
 
-    # 掉出地图 → 直接判死，再走重生流程
-    if player.y < -12 and state.alive:
-        state.take_damage(999, ignore_armor=True)
+    # 边界兜底：越界（理论上被墙挡住）→ 传回出生点，不再判死
+    if state.alive and duel_arena is not None:
+        _b = cover_map.BOUND + 0.8
+        if abs(player.x) > _b or abs(player.z) > _b:
+            player.position = (max(-_b, min(_b, player.x)), max(1.5, player.y),
+                               max(-_b, min(_b, player.z)))
+    if player.y < -6 and state.alive:
+        respawn_player()
+        hud.banner('已回到出生点', 1.2, T.C_WARN)
 
     if not state.alive:
         player.enabled = False
         if mouse.locked:
             mouse.locked = False
             mouse.visible = True
+        # 死亡面板（按死因展示击杀者/武器/部位/伤害；一次死亡只弹一次）
+        if _death_shown != state.deaths:
+            _death_shown = state.deaths
+            killcam_pos = None
+            _killer = last_hit.get('killer') or ''
+            for _b in bots:
+                if _b.name == _killer:
+                    killcam_pos = tuple(_b.root.world_position)
+                    break
+            if remote_world is not None and killcam_pos is None:
+                for _a in remote_world.actors.values():
+                    if _a.name == _killer:
+                        killcam_pos = tuple(_a.root.world_position)
+                        break
+            if last_hit.get('pos'):
+                killcam_pos = killcam_pos or tuple(last_hit['pos'])
+            _show_death_panel()
+        death_panel.tick(dt)
+        _killcam_view(dt)
         if state.death_time <= 0 and not paused:
+            death_panel.hide()
             respawn_player()
+    elif death_panel.visible:
+        death_panel.hide()
 
     # ---- 第三人称（V）：镜头拉到人物身后，人物模型可见并按速度切动画 ----
     if third_person:
@@ -1090,24 +1523,27 @@ def update():
     if state.alive and not scoping and not third_person:
         viewmodel.tick(dt, weapon, player)
 
-    # ---- 联机：消费服务器权威比分 / 拒绝回执 ----
+    # ---- 联机：20Hz 状态上报 + 消费权威快照 ----
     if game_net is not None:
-        while True:
-            try:
-                _msg = game_net.score_queue.get_nowait()
-            except queue.Empty:
-                break
-            if _msg.get('t') == 'score_update':
-                _stats = _msg.get('stats', {})
-                _mine = _stats.get(str(MY_MEMBER_ID))
-                if _mine:
-                    state.score = int(_mine.get('score', state.score))
-                _enemy_ids = [str(b.member_id) for b in bots if b.member_id]
-                blue_score = sum(int(_stats.get(_e, {}).get('score', 0))
-                                 for _e in _enemy_ids)
-            elif _msg.get('t') == 'claim_reject':
-                hud.banner(f'命中声明被服务器拒绝：{_msg.get("reason", "")}',
-                           1.8, T.C_DANGER)
+        game_net.send_state(player.world_position, player.rotation_y,
+                            player.camera_pivot.rotation_x,
+                            viewmodel.active_key, state.alive,
+                            firing=held_keys['left mouse'])
+        for _msg in game_net.drain():
+            _kind = _msg.get('t')
+            if _kind == 'snapshot':
+                _apply_snapshot(_msg, dt)
+            elif _kind == 'result':
+                end_match(_msg.get('result'), 'server')
+            elif _kind == 'cmd_apply':
+                _apply_cmd(_msg.get('cmd'))
+            elif _kind == 'lobby':
+                if not match_ended:
+                    end_match(None, 'lobby')
+            elif _kind == 'start':
+                _reset_match(_msg.get('game'))
+            elif _kind == 'claim_reject':
+                hud.banner(f'服务器拒绝：{_msg.get("reason", "")}', 1.6, T.C_DANGER)
 
     hud.update(dt, player, targets)
     if scoreboard.visible:
@@ -1142,7 +1578,27 @@ if SHOT_PATH:
         print('[shot] win', base.win.getXSize(), 'x', base.win.getYSize(),
               '| aspect', round(a, 3),
               '| ui_lens', [round(v, 3) for v in camera.ui_lens.getFilmSize()])
-        ok = base.win.getScreenshot().write(Filename(SHOT_PATH))
+        # 打包后 panda3d 的 PNMImage.write 对绝对路径（非 ASCII 目录）会失败：
+        # 先写到当前目录的相对文件名，再用 Python 移动到目标位置（可写中文路径）。
+        _tmp = '_shot_tmp.png'
+        ok = base.win.getScreenshot().write(Filename(_tmp))
+        if ok:
+            _target = SHOT_PATH if os.path.isabs(SHOT_PATH) else os.path.abspath(SHOT_PATH)
+            try:
+                if os.path.dirname(_target):
+                    os.makedirs(os.path.dirname(_target), exist_ok=True)
+                if os.path.exists(_target):
+                    os.remove(_target)
+                os.replace(_tmp, _target)
+            except OSError:
+                # 部分环境（打包 exe / 安全软件）禁止跨目录 rename，改用复制+删除
+                try:
+                    import shutil
+                    shutil.copyfile(_tmp, _target)
+                    os.remove(_tmp)
+                except OSError as _exc:
+                    print('[shot] 写入目标路径失败:', _exc)
+                    ok = False
         print('[shot]', SHOT_PATH, ok)
         application.quit()
 
@@ -1192,11 +1648,72 @@ if SHOT_PATH:
                 invoke(_snap, delay=0.60)
             return
 
+        if SHOT_VIEW == 'netdemo':
+            # 远端实体渲染演示（不联机也能验证快照渲染链路）
+            _demo_world = REMOTE.RemoteWorld()
+            _demo = [
+                {'id': 900001, 'name': 'BOT-B1', 'team': 'blue', 'bot': True,
+                 'pos': [2.6, 0, 6.0], 'yaw': 205, 'pitch': 0, 'hp': 64,
+                 'alive': True, 'weapon': 'ak'},
+                {'id': 900002, 'name': 'BOT-B2', 'team': 'blue', 'bot': True,
+                 'pos': [-2.4, 0, 9.0], 'yaw': 160, 'pitch': 0, 'hp': 0,
+                 'alive': False, 'weapon': 'ak'},
+            ]
+
+            def _demo_setup():
+                player.position = (0, 1.6, -24)
+                player.rotation_y = 0
+                player.camera_pivot.rotation_x = -3
+                _demo[0]['pos'] = [2.2, 0, -18.5]
+                _demo[0]['yaw'] = 200
+                _demo[1]['pos'] = [-2.4, 0, -15.5]
+                _demo[1]['yaw'] = 160
+
+            def _demo_spawn():
+                _demo_world.update(_demo, -1, 0.016)
+                _demo_world.update(_demo, -1, 0.016)
+
+            invoke(_demo_setup, delay=0.25)
+            invoke(_demo_spawn, delay=0.4)
+            invoke(lambda: _demo_world.update(_demo, -1, 0.016), delay=0.8)
+            invoke(_snap, delay=1.0)
+            return
+        if SHOT_VIEW == 'results':
+            _res = {'reason': 'score', 'winner': 'red',
+                    'score': {'red': 50, 'blue': 38},
+                    'rows': [
+                        {'name': NICKNAME, 'team': 'red', 'kills': 18, 'deaths': 6,
+                         'assists': 0, 'score': 180},
+                        {'name': 'BOT-B1', 'team': 'blue', 'kills': 11, 'deaths': 9,
+                         'assists': 0, 'score': 110},
+                        {'name': 'BOT-B2', 'team': 'blue', 'kills': 7, 'deaths': 12,
+                         'assists': 0, 'score': 70},
+                    ],
+                    'mvp': {'name': NICKNAME, 'team': 'red', 'score': 180}}
+            invoke(lambda: results_page.show_result(_res), delay=0.40)
+            invoke(_snap, delay=0.85)
+            return
+        if SHOT_VIEW == 'death':
+            def _show_death():
+                last_hit.update({'killer': 'BOT-B1', 'weapon': 'ak',
+                                 'zone': 'head', 'damage': 144, 'cause': '爆头'})
+                state.die()
+                _show_death_panel()
+            invoke(_show_death, delay=0.35)
+            invoke(_snap, delay=0.85)
+            return
+        if SHOT_VIEW == 'map':
+            invoke(toggle_third_person, delay=0.25)
+            invoke(_snap, delay=1.10)
+            return
         if SHOT_VIEW == 'pause':
             toggle_pause(True)
         elif SHOT_VIEW == 'settings':
             toggle_pause(True)
             pause_menu.set_page(pause_menu.PAGE_SETTINGS)
+        elif SHOT_VIEW == 'keys':
+            toggle_pause(True)
+            pause_menu.set_page(pause_menu.PAGE_KEYS)
         elif SHOT_VIEW == 'quit':
             toggle_pause(True)
             pause_menu.set_page(pause_menu.PAGE_QUIT)
@@ -1420,7 +1937,7 @@ if SELFTEST:
 
         # 团队模式（--map team 运行时才有）
         if TEAM:
-            ok.append(('团队出生点在红队半场', player.z < -35))
+            ok.append(('团队出生点在红队半场', player.z < -25))
             ok.append(('蓝队木偶人已放置', len(dummies) >= 5
                         and all(p.dummy_part in ZONE_MULTIPLIERS
                                 for d in dummies for p in d.parts)))
@@ -1448,8 +1965,71 @@ if SELFTEST:
 
         # 单挑地图（--map duel 运行时才有）
         if DUEL and duel_arena:
-            ok.append(('单挑地图有碰撞体', duel_arena.collider_count > 5))
-            ok.append(('单挑出生点在墙内', abs(player.z) <= 45 and abs(player.x) <= 25))
+            ok.append(('单挑地图有碰撞体', getattr(duel_arena, 'block_count', 0) > 5))
+            ok.append(('单挑出生点在墙内', abs(player.z) <= cover_map.BOUND and abs(player.x) <= cover_map.BOUND))
+
+        # ---- 掩体地图 / 边界 ----
+        if duel_arena is not None:
+            ok.append(('掩体地图方块数 ≥ 20', getattr(duel_arena, 'block_count', 0) >= 20))
+            ok.append(('地图实体障碍 ≥ 20', len(cover_map.OBSTACLES) >= 20))
+            ok.append(('隐形边界已生成', len(cover_map.INVISIBLE) >= 4))
+            ok.append(('出生点未被障碍堵住',
+                        all(not cover_map.point_blocked(x, z, 0.55)
+                            for team in ('red', 'blue')
+                            for (x, _y, z, _yaw) in cover_map.SPAWNS[team])))
+
+        # ---- 准星样式 ----
+        _styles_ok = True
+        for _s in ('cross', 'dot', 't', 'thick'):
+            try:
+                hud.set_crosshair(_s)
+                if hud.crosshair.style != _s:
+                    _styles_ok = False
+            except Exception:  # noqa: BLE001
+                _styles_ok = False
+        hud.set_crosshair(SETTINGS.get('crosshair', 'cross'))
+        ok.append(('准星四种样式可切换', _styles_ok))
+
+        # ---- 键位自定义 ----
+        pause_menu.set_page(pause_menu.PAGE_KEYS)
+        pause_menu.begin_bind('reload')
+        _captured = pause_menu.capture_key('x')
+        ok.append(('改键捕获生效', _captured and KEYMAP.get('reload') == 'x'))
+        on_keybind('reload', KEYMAP_DEFAULT['reload'])
+        ok.append(('改键可恢复默认', KEYMAP.get('reload') == 'r'))
+        pause_menu.set_page(pause_menu.PAGE_RESUME)
+
+        # ---- 房主指令（cmd_apply 消费路径） ----
+        _apply_cmd({'name': 'god', 'target': ['all'], 'value': True})
+        ok.append(('god 指令生效', god_mode is True))
+        _apply_cmd({'name': 'god', 'target': ['all'], 'value': False})
+        _apply_cmd({'name': 'speed', 'target': [NICKNAME], 'value': 2.0})
+        ok.append(('speed 指令生效', abs(player.speed - 16.0) < 0.1))
+        player.speed = 8.0
+        _apply_cmd({'name': 'respawn', 'value': 1})
+        ok.append(('respawn 指令生效', abs(state.respawn_delay - 1.0) < 0.01))
+        state.respawn_delay = 3.0
+        _px, _pz = player.x, player.z
+        _apply_cmd({'name': 'tp', 'target': [NICKNAME], 'x': 3.0, 'z': 5.0})
+        ok.append(('tp 指令生效', abs(player.x - 3.0) < 0.2 and abs(player.z - 5.0) < 0.2))
+        player.position = (_px, player.y, _pz)
+
+        # ---- 结算页 / 死亡面板 ----
+        results_page.show_result({
+            'reason': 'score', 'winner': 'red',
+            'score': {'red': 50, 'blue': 38},
+            'rows': [{'name': NICKNAME, 'team': 'red', 'kills': 18, 'deaths': 6,
+                      'assists': 0, 'score': 180}],
+            'mvp': {'name': NICKNAME, 'team': 'red', 'score': 180},
+        })
+        ok.append(('结算页可展示', results_page.visible))
+        results_page.hide()
+        death_panel.show_death('BOT-B1', 'AK-47', 'head', 144, 3.0, False)
+        ok.append(('死亡面板可展示', death_panel.visible))
+        ok.append(('死亡面板含击杀者与部位',
+                    'BOT-B1' in death_panel.lbl_killer.text
+                    and '头部' in death_panel.lbl_zone.text))
+        death_panel.hide()
 
         state.take_damage(999)
         ok.append(('死亡状态', not state.alive))
@@ -1457,7 +2037,17 @@ if SELFTEST:
         ok.append(('重生满血', state.alive and state.health == 100))
         for name, cond in ok:
             print(f"[selftest] {'PASS' if cond else 'FAIL'} {name}")
-        print('[selftest]', 'ALL PASS' if all(c for _, c in ok) else 'HAS FAIL')
+        all_pass = all(c for _, c in ok)
+        print('[selftest]', 'ALL PASS' if all_pass else 'HAS FAIL')
+        if SELFTEST_LOG:
+            try:
+                with open(SELFTEST_LOG, 'w', encoding='utf-8') as _fp:
+                    _fp.write(f'frozen={FROZEN} res_dir={RES_DIR}\n')
+                    for name, cond in ok:
+                        _fp.write(f"[{'PASS' if cond else 'FAIL'}] {name}\n")
+                    _fp.write('ALL PASS\n' if all_pass else 'HAS FAIL\n')
+            except OSError as _exc:
+                print('[selftest] 写结果文件失败:', _exc)
         application.quit()
 
     invoke(_selftest, delay=0.9)

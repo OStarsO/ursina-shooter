@@ -13,6 +13,7 @@ dist/
 build/
 build_launcher/
 *.spec
+!射击.spec
 *.manifest
 
 # ---- 运行时生成 ----
@@ -40,3 +41,8 @@ Thumbs.db
 _ffs.7z
 _rl_*.wav
 _dl_*.log
+
+# ---- 游戏本体打包产物 ----
+dist_game/
+build_game/
+_apply_update.bat

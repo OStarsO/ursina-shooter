@@ -32,6 +32,63 @@ def drain(q, seconds=1.0):
     return out
 
 
+def test_world_sync():
+    """权威世界联调：快照下行、cmd_apply 送达、lobby 送达。"""
+    from game_net import GameNet
+
+    svc = rn.RoomService("房主", "duel")
+    svc.start()
+    time.sleep(0.3)
+    svc.add_bots("blue", 1, "normal")
+    bot = next(m for m in svc.member_list() if m["is_bot"])
+    # 直接起世界（start_game 要求 2 名真人，测试里跳过人数校验）
+    with svc._lock:
+        svc.room["state"] = "playing"
+    svc._start_world({"mode": "duel", "score_target": 50, "time_limit": 300})
+    time.sleep(0.2)
+
+    gn = GameNet("127.0.0.1", rn.ROOM_PORT, svc.host_member["token"])
+    check("游戏通道接入权威世界", gn.start())
+    time.sleep(0.6)
+
+    msgs = gn.drain()
+    snaps = [m for m in msgs if m.get("t") == "snapshot"]
+    check("收到服务端快照", len(snaps) >= 1, f"{len(snaps)} 帧")
+    if snaps:
+        ents = snaps[-1].get("entities") or []
+        ids = {e["id"] for e in ents}
+        check("快照含玩家与机器人", svc.host_member["id"] in ids and bot["id"] in ids)
+        check("快照含比分/计时",
+              "score" in snaps[-1] and "time_left" in snaps[-1])
+
+    # 上行状态 → 快照反映位置
+    host_id = svc.host_member["id"]
+    gn.send_state((5, 0, -20), 90, 0, "ak", True)
+    time.sleep(0.4)
+    snaps = [m for m in gn.drain() if m.get("t") == "snapshot"]
+    if snaps:
+        me = next((e for e in snaps[-1]["entities"] if e["id"] == host_id), None)
+        check("客户端状态进入权威世界", me is not None and abs(me["pos"][0] - 5) < 1.5,
+              str(me and me["pos"]))
+
+    # cmd_apply：god all 必须同时到达游戏进程与服务端世界
+    svc.execute_command("god all")
+    time.sleep(0.4)
+    cmds = [m for m in gn.drain() if m.get("t") == "cmd_apply"]
+    check("cmd_apply 送达游戏进程", any(m.get("cmd", {}).get("name") == "god" for m in cmds),
+          str(cmds[-1:] if cmds else []))
+    check("god 同步到服务端世界",
+          svc.world is not None and svc.world.entities[host_id]["god"] is True)
+
+    # lobby：结束对局必须送达游戏进程
+    svc.end_game("测试结束")
+    time.sleep(0.3)
+    lobbies = [m for m in gn.drain() if m.get("t") == "lobby"]
+    check("lobby 送达游戏进程", bool(lobbies), str(lobbies[-1:] if lobbies else []))
+    gn.stop()
+    svc.stop()
+
+
 def main():
     srv = rn.RoomService("房主", "duel", room_name="测试房", password="123", settings={"score_target": 10, "time_limit": 300})
     ok = srv.start()
@@ -185,6 +242,7 @@ def main():
     team.stop()
 
     test_anticheat()
+    test_world_sync()
 
     print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
     if FAIL:

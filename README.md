@@ -36,9 +36,22 @@
   权威比分 `score_update` 广播全员；被拒声明会在游戏内横幅提示
 - **毛玻璃 UI**：所有面板背景为半透明磨砂玻璃（低分辨率离屏缓冲 + GLSL 采样），
   任意分辨率下采样正确、文字对比度充足；不支持时自动退化为纯色面板
-- **对战地图（CC-BY）**：启动器选「单挑」或「团队竞技」即加载封闭竞技场（50×100 米，
-  自动生成碰撞体）；单挑为点对称出生点，团队模式红蓝双方底线横排出生、
-  击杀蓝队目标计分、**先达到 50 分判胜**
+- **对战地图（cube 拼装）**：启动器选「单挑」或「团队竞技」即加载代码生成的掩体地图
+  （80×80 米，37 个方块：外周墙 + 12m 隐形边界、中央高台、两段错位走廊、对称箱体、
+  两侧 L 形房间；红蓝各 3 个出生点）；几何数据 `cover_map.OBSTACLES` 与**服务端
+  弹道共用同一份**，客户端渲染与服务端判定不会漂移
+- **服务端权威联机**：游戏进程 `game_hello(token)` 长连，客户端 20Hz 上送
+  位置/朝向/武器（`state`）与每次开火（`fire`）；服务端 `netsim` 以 20Hz 模拟
+  玩家+机器人、按弹道与部位倍率算伤害/血量/比分，15Hz 下行快照（实体/事件/结算）；
+  房主作弊指令 `cmd_apply` 与 `start`/`lobby` 同时送达游戏进程
+- **服务端机器人**：房主大厅「人机补齐」的 BOT 由服务端模拟（巡逻/追击/高斯
+  弹道/被击倒/3 秒复活），客户端只渲染快照；单机模式仍用本地 AI（同一套难度参数）
+- **结算闭环**：比分达 `score_target` 或计时归零 → 结算页（红蓝比分 / 每位玩家
+  K/D/A / MVP）→ 广播 `lobby` 回大厅；单机与联机共用同一套结算 UI 与流程
+- **阵亡面板**：击杀者、武器、命中部位（头/躯干/肢体）、伤害、死因（击杀/坠落）、
+  重生倒计时；可选「击杀者镜头」把镜头切到击杀者身后（设置项，默认关）
+- **游戏内设置**：灵敏度、主/音效/界面音量分轨、准星四种样式（十字/圆点/T 形/粗十字）、
+  画质档位（可视距离 + 毛玻璃开关）、分辨率切换即时生效、全屏、六项键位自定义
 - **CS:GO 风格 HUD**：左下血量/护甲、右下弹药与武器名、顶部比分与计时、左上雷达、右上击杀提示、底部按键提示条
 - **命中反馈**：绿色十字准星常驻；红色命中标记仅在子弹命中物体或敌人时短暂闪现
 - **音效**：每把武器使用**独立音色枪声**（USP 清脆短促 / 沙鹰厚重炮吼 / AK 连发
@@ -58,11 +71,16 @@
 ### 启动器（`launcher.py` + `net_ui.py` + `room_net.py`）
 - **游客登录**：输入昵称即进入，昵称持久化并可随时切换；邮箱登录页签已预留
 - **环境自检**：探测可用 Python、ursina / panda3d 版本、中文字体与音效文件，异常时给出修复入口
+- **自动更新**：启动后自动查询 GitHub Releases 最新版本（也可在「我的」页手动点「检查更新」），
+  发现新版本可一键下载、替换并自动重启；资产下载直连 GitHub 失败时按序切换加速镜像
+- **依赖安装镜像优先**：创建 `.venv` 安装 ursina/panda3d 时依次探测清华 / 阿里云 / 腾讯云
+  镜像（单源 5 秒超时），全部不可用或安装失败才回退官方 PyPI
 - **模式选择**：训练场（本地单机）/ 单挑 1v1 / 团队竞技 5v5、10v10
 - **局域网联机**：创建房间（监听 TCP 25250、可设密码、预配置目标比分与时长）或加入房间（扫描本网段所有 IP 的 25250 端口，也可手输房主 IP）
-- **房间大厅**：红蓝分队、成员同步、房主开始/锁定/改密码，加入方等待开始信号自动进入游戏
+- **房间大厅**：红蓝分队、成员同步、人机补齐（三档难度）、房主开始/锁定/改密码，加入方等待开始信号自动进入游戏
 - **房主控制台**：比赛控制、玩家作弊、机器人补位、房间管理四组命令，作弊指令始终向全员广播
 - **工程化**：配置持久化、game 进程托管与日志、崩溃提示、单实例锁、一键打包 exe
+  （启动器与游戏本体都可打包；游戏自带运行时，打包版无需本机 Python）
 - **客户端自补齐游戏文件（v1.2.0）**：exe 只打包启动器本体；首次启动会先让你选择游戏文件保存位置，
   再从本仓库（`OStarsO/ursina-shooter`）下载补齐 `射击.py` 与 `assets/ fonts/ maps/ sfx/ characters/ weapons/`
   等运行所需文件（50 个文件、约 5.6 MB）。通道顺序 `codeload zip → api zipball → 逐文件`，
@@ -122,7 +140,7 @@ python 射击.py              # 也可直接运行游戏
 | B | 打开 / 关闭武器商店（价格全部为 0） |
 | V | 第一 / 第三人称切换（第三人称可见人物模型与动画） |
 | Tab（按住） | 计分板 |
-| ESC | 关闭商店 / 暂停菜单 |
+| ESC | 关闭商店 / 暂停菜单（设置：准星 / 画质 / 分辨率 / 音量分轨 / 键位 / 击杀者镜头） |
 | F1 / F2 | 自测：扣 22 血 / 补满血甲 |
 
 **自检**
@@ -227,10 +245,12 @@ camera
 **CC-BY 3.0** 授权——免费且允许商用，唯一义务是保留署名；
 本项目在 [`maps/LICENSES.md`](maps/LICENSES.md)、`arena.py` 注释与本页保留了署名与来源链接。
 
-人物模型 `characters/soldier.glb`（Quaternius 士兵，24 条骨骼动画）为
+人物模型 `characters/soldier.bam`（由 `soldier.glb` 预转换，Quaternius 士兵，24 条骨骼动画）为
 **CC0 1.0** 授权——可商用、无需署名；原作者 Quaternius（https://quaternius.com），
 经 Cinevva CC0 角色库分发（https://app.cinevva.com/game-assets/free-3d-character-models），
 许可文件与加工说明见 [`characters/LICENSE.txt`](characters/LICENSE.txt)。
+BAM 由 `tools/build_char_bam.py` 生成（打包后 glTF 动画解析在冻结环境会触发帧数断言，
+预转换后运行时走 panda3d 原生 BAM 加载，行为与源码模式一致）。
 
 音效（`sfx/`，授权明细见 [`sfx/LICENSE.txt`](sfx/LICENSE.txt)）：
 - 绝大多数为本项目 Python 标准库程序合成的原创音频（等同 CC0）：每把武器
@@ -274,6 +294,27 @@ camera
 4. 加入方仍连不上时，用 `ipconfig` 确认真实 IPv4，手动输入房主 IP（端口固定 25250，无需填写）。
 
 ---
+
+## 联机权威同步（服务端模拟）
+
+```
+客户端（游戏进程）                        服务端（房主启动器进程）
+  每 20Hz  ── state 位置/朝向/武器 ──▶   netsim.World.set_state
+  每次开火 ── fire 起点/方向 ────────▶   弹道：AABB 遮挡 + 胶囊命中
+                                          射速节流（60/rpm×0.9）+ 部位倍率
+  ◀── 15Hz snapshot 实体/血量/比分/事件 ─ 机器人 AI / 复活 / 计时 / 胜负
+  ◀── cmd_apply（god/speed/damage/…） ─  房主控制台（同时同步到服务端世界）
+  ◀── start / result / lobby ──────────  开局、结算与回大厅
+```
+
+- **判定权**：命中、伤害、血量、死亡、比分全部在服务端算；客户端只上报
+  「我在哪、朝哪看、往哪打」，改伤害/超射速/穿墙在服务端弹道下不成立。
+- **机器人**：服务端模拟（三档难度：反应/角度误差/射速/移速/伤害倍率），
+  巡逻→发现→点射→被击倒→3 秒复活；客户端通过快照渲染（插值 + 队伍色环 + 昵称血条）。
+- **结算**：`score_target` 达标或计时归零 → 服务端下发 `result`（红蓝比分 / KDA / MVP），
+  客户端弹出结算页；8 秒后广播 `lobby` 回大厅（单机走同一套 `end_match()` 流程）。
+- **命令**：`god/speed/damage/ammo_inf/kill/tp/respawn` 通过 `cmd_apply` 同时
+  送达游戏进程与服务端世界（例如 `god` 既让客户端免疫也服务端免伤）。
 
 ## 控制台命令（仅房主）
 
@@ -322,12 +363,16 @@ camera
 ├── hud.py                  # HUD：血量护甲、弹药、雷达、比分、击杀提示、准星、狙击镜遮罩
 ├── menu.py                 # 暂停菜单与 Tab 计分板
 ├── combat.py               # 数值系统：血量 / 护甲 / 弹药 / 换弹 / 近战 / 摔落伤害 / 分部位伤害倍率
-├── arena.py                # duel_arena 地图：1v1 单挑 / 团队竞技共用，出生点与胜利分数（CC-BY 署名）
+├── arena.py                # （旧）duel_arena.glb 地图加载；现由 cover_map 取代，保留参考与 CC-BY 署名
 ├── dummies.py              # 木偶人训练靶：头/胸/躯干/四肢分部位判定、巡航与倒地重生
+├── cover_map.py            # cube 拼装掩体地图：AABB 几何 + 出生点 + 场景构建（服务端共用）
+├── netsim.py               # 服务端权威世界：机器人 AI / 弹道命中 / 血量 / 胜负 / 快照
+├── remote_actors.py        # 远端实体渲染：快照插值、队伍色/脚下色环、昵称血条、死亡动画
 ├── bots.py                 # 人机：三档难度 AI（搜索/瞄准/高斯弹道）、阵营着色、击倒重生
 ├── maps/                   # duel_arena.glb + LICENSES.md（CC-BY 3.0 署名说明）
 ├── shop.py                 # 武器选择商店：开局弹出 + B 键呼出，主/副武器两栏，价格全部 0
-├── characters/             # Quaternius Soldier 人物模型（CC0，含 LICENSE.txt，24 条骨骼动画）
+├── characters/             # Quaternius Soldier 人物模型（CC0）：soldier.bam（运行时）/ soldier.glb（源）
+├── tools/                  # 维护脚本：fix_glb / make_sfx / build_char_bam（GLB→BAM 预转换）/ upload_github
 ├── sfx/                    # 音效：自制合成 + CC0 第三方素材（明细见 LICENSE.txt）
 ├── weapons/                # 武器：配置（槽位/后坐力分级）/ 动画数学 / GLB 载入 / 视图模型 + models/ + LICENSES.md
 ├── fonts/                  # Rajdhani + Barlow Condensed（OFL 1.1，含许可证文本）
@@ -337,14 +382,18 @@ camera
 ├── anticheat.py            # 服务器端反作弊：射速节流 / 伤害权威计算 / 重生窗口 / 身份约束
 ├── game_net.py             # 游戏进程实时通道：hit_claim 上报与权威比分接收
 ├── app_style.py            # 启动器共享配色与控件样式
+├── updater.py              # GitHub Releases 自动更新：版本比较 / 资产镜像回退下载 / 自替换脚本
 ├── winfix.py               # 窗口状态保持补丁 + 输入法屏蔽（ImmAssociateContext）
-├── tests_room.py           # 协议层测试：63 项（含反作弊验证 16 项）
+├── tests_room.py           # 协议层测试：71 项（含反作弊 16 项 + 权威同步联调 8 项）
+├── tests_update.py         # 自动更新测试：24 项（版本比较 / 资产选择 / 镜像回退 / 自替换脚本）
+├── tests_netsim.py         # 服务端权威世界测试：31 项（弹道/部位/射速/机器人/胜负/快照）
 ├── tests_ui.py             # 大厅端到端测试：17 项
 ├── tests_combat.py         # 数值系统测试：44 项（含分部位伤害倍率）
 ├── tests_weapons.py        # 武器配置 / 动画数学 / GLB 资源测试：55 项
 ├── tests_window.py         # 窗口位置/尺寸保持 + 输入法屏蔽测试：15 项（含 bug 复现对照组）
 ├── assets/icon.(ico|png)   # 应用图标
-└── dist/                   # 打包产物（未纳入版本库）
+├── 射击.spec               # 游戏本体 PyInstaller 打包配置（onedir + 资源/data 收集）
+└── dist/ dist_game/        # 打包产物（未纳入版本库）
 ```
 
 运行时生成的 `ui_cache/`（程序化 UI 贴图）与 `settings.json` / `scores.json` 均不入版本库。
@@ -359,31 +408,103 @@ python tests_ui.py      # 大厅成员同步、控制台下发、双方自动启
 python tests_combat.py  # 伤害与护甲公式、弹匣/换弹、回血、死亡与重生
 python tests_weapons.py # 武器配置/关键帧合法性/动画插值/GLB 结构/近战数值
 python tests_window.py  # 窗口拖动/缩放后鼠标锁定切换不再还原（含 bug 复现对照）
+python tests_update.py  # 自动更新：版本比较/资产筛选/镜像回退/替换脚本（无需联网）
+python tests_netsim.py  # 服务端权威世界：弹道/部位倍率/射速/机器人/胜负/快照（无需联网）
 python 射击.py --selftest   # 游戏内 UI 与状态链路
 ```
 
-## 打包为 exe
+## 客户端自动更新与发布
+
+```
+启动器启动 6 秒后自动检查（也可在「我的」页手动点「检查更新」）
+  → GET https://api.github.com/repos/OStarsO/ursina-shooter/releases/latest
+  → 解析 tag（v1.3.0）与资产列表，按语义化版本比较本地 APP_VERSION
+  → 无更新：状态栏显示"已是最新版本"
+  → 有更新：弹窗展示版本与更新说明
+       打包运行：确认后下载 exe → 生成 _apply_update.bat → 退出 → 批处理
+                 等待文件锁释放 → 覆盖 exe → 重启新版本 → 删除自身
+       源码运行：只提示新版本与发布页（不替换开发目录）
+```
+
+- **资产下载镜像回退**：直连 `github.com/.../releases/download/...` 失败（超时 / 4xx / 连接重置）
+  时，按 `ASSET_MIRRORS` 顺序尝试加速前缀（gh-proxy / ghfast），全部失败才报错；
+  下载完整性用资产 `size` 校验，不完整一律判失败并清理 `.part`。
+- **API 请求**：直连 GitHub API（镜像不代理 api 域名），带 `User-Agent`；
+  404（仓库/Release 不存在）、403（限流）都会转成中文提示。
+- **发布**：推 `v*` 标签 → GitHub Actions 构建启动器 exe 与游戏本体 zip；
+  在 Release 上传 `ursina-shooter-launcher-vX.Y.Z.exe` 即被自动更新识别（资产名含
+  `launcher`）。游戏本体（打包版）资源的大版本更新走 Release 里的 game zip，
+  启动器的自动更新只替换启动器自身。
+
+## 打包为 exe（启动器 + 游戏本体）
 
 ```bash
 pip install pyinstaller
+
+# 启动器（单文件，不含游戏资源，首次运行从 GitHub 补齐游戏文件）
+# 注意：--specpath 会让生成的 spec 落在 build/，图标必须写绝对路径
 pyinstaller --noconfirm --onefile --windowed --name "射击启动器" ^
-  --icon "assets/icon.ico" --distpath dist --workpath build --specpath build ^
+  --icon "%CD%\assets\icon.ico" --distpath dist --workpath build --specpath build ^
   --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtQml ^
   --exclude-module PySide6.QtQuick --exclude-module tkinter launcher.py
+
+# 游戏本体（onedir：exe + _internal 资源，内置 panda3d/ursina 运行时）
+pyinstaller --noconfirm --distpath dist_game --workpath build_game 射击.spec
+```
+
+**资源白模 / 加载失败的修法**（本仓库已内置）：
+
+1. **资源必须进包**：`射击.spec` 把 `characters/ sfx/ maps/ fonts/ weapons/models/ assets/`
+   与 `panda3d / ursina / direct / gltf` 的包内数据（prc 配置、shader、内置模型/字体）
+   全部 `collect_data_files` 收集——缺 panda3d 的 shader 会 GLSL 报错，缺 ursina 内置
+   模型/字体会白模或字体丢失。
+2. **运行时工作目录切到资源根**：`射击.py` 启动时把 cwd 切到 `sys._MEIPASS`
+   （onedir 下为 `_internal/`），所有相对路径（`characters/soldier.glb` 等）才能命中。
+3. **存档与资源分离**：`settings.json / scores.json` 写在 exe 同级目录（持久化），
+   不写进 `_internal`（升级/清理不会丢档）。
+4. **窗口程序无控制台**：打包后 `sys.stdout` 为 None，游戏内已兜底到空设备；
+   自检结果用 `--selftest-log 结果.txt` 落盘，便于 CI / 无控制台环境验证资源加载。
+5. **onefile vs onedir**：游戏本体用 onedir——onefile 每次启动解压几十 MB 且临时目录
+   路径不稳定，正是白模/贴图丢失的高发场景。
+
+验证打包结果（无需人工点界面）：
+
+```bash
+dist_game\射击\射击.exe --selftest --selftest-log dist_game\selftest.txt
+dist_game\射击\射击.exe --shot dist_game\shot.png --view third
 ```
 
 推 tag（`v*`）时 GitHub Actions 会自动构建 exe 并附到 Release（见 `.github/workflows/release.yml`）。
 
 ---
 
+## 本轮改造清单（P0 / P1）
+
+| 项 | 估量（新增/改动行） | 依赖 | 实现顺序 |
+|---|---|---|---|
+| P1-1 掩体地图 | ~260（`cover_map.py`） | 无 | 1 |
+| P1-2 边界墙 | ~30（并入 cover_map：外周实体墙 + 12m 隐形墙 + 越界夹取/回出生点） | P1-1 | 1（同批） |
+| P0-2 服务端机器人 | ~210（`netsim` 机器人 AI + 复活 + 难度表） | P1-1 几何 | 2 |
+| P0-1 权威同步 | ~500（`netsim` 弹道/世界 400 + `game_net` 130 + `room_net` tick/广播 + 客户端接入） | P1-1 / P0-2 | 3 |
+| P0-3 结算闭环 | ~190（`menu.ResultsPage` + `end_match` / 服务端 `_finish` / `lobby`） | 比分来源（P0-1、单机计时） | 4 |
+| P1-3 死亡面板 | ~150（`menu.DeathPanel` + 死因记录 + 击杀者镜头） | 击杀来源（本地 bot / 服务端 kill 事件） | 4（与 P0-3 同批） |
+| P1-4 设置增强 | ~280（菜单设置/键位页 + HUD 准星样式 + 画质/分辨率/音量总线） | HUD、窗口 | 5（可并行） |
+
+依赖关系：P0-1 依赖地图几何（P1-1）与服务端实体（P0-2）；P0-3/P1-3 依赖击杀来源
+（本地 AI 或 P0-1 的 kill 事件）；P1-4 相对独立，放最后避免与协议联调互相干扰。
+
 ## 已知限制
 
-- **联机对战的位置/射击同步尚未接入**：当前对局内同步的是房间层信息与命中声明
-  （击倒人机 / 被人机击中→服务器验证计分），玩家在世界中的实时位置仍是本机模拟；
-  因此服务器能防"超频射击 / 改伤害 / 鞭尸刷分 / 伪造身份"，但无法检测透视、自瞄类
-  外挂（需要完整位置同步与服务器端弹道模拟，属下一阶段）。
-- 单挑需 2 人；人数不足时房主可在大厅点「人机补齐」用 BOT 填满两队（三档难度）。
-- 人机运行在各端本地（视觉一致，比分经服务器权威验证）；我方人机随队巡航不主动交火。
+- **自动更新只替换启动器自身**：打包版游戏本体（`射击.exe` + `_internal`）体积大且
+  升级时文件占用，需用 Release 里的 game zip 覆盖；源码运行时只提示新版本、不自动替换。
+- 依赖安装镜像优先但**不强制**：镜像装失败会自动回退官方 PyPI，两者都不通才报错。
+- **联机为「服务端权威判定 + 客户端权威移动」**：位置由各客户端上报、服务端只做
+  边界夹取，未做移动速度校验与延迟补偿（回滚/插值）；因此瞬移类作弊仍靠
+  `tp` 指令白名单外的行为难以检测，属下一阶段（服务器导航网格 + 速度上限校验）。
+- 机器人跑在房主服务端（`netsim`），单机模式跑本地 AI；两者难度参数一致、
+  但单机机器人不参与服务端比分。
+- 键位自定义覆盖 换弹/商店/检视/第三人称/计分板/暂停 六项；移动仍固定 WASD
+  （FPC 内部控制）。
 - 游戏窗口内输入法已被摘除（无法输入中文）——游戏本身没有任何文本输入框，无实际影响。
 - 引擎对 Python 3.13+ 暂无 panda3d 轮子，请使用 3.11 / 3.12。
 

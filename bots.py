@@ -21,6 +21,7 @@ anticheat.AntiCheat 的规则（射速 / 单发伤害上限 / 部位倍率 / 目
 """
 
 import math
+import os
 import random
 
 from ursina import Entity, color, raycast, Vec3
@@ -29,8 +30,15 @@ import combat
 from combat import ZONE_MULTIPLIERS, classify_zone_by_height
 from weapons.config import CATALOG as WEAPON_CATALOG
 
-# 队伍着色（RGB 0-1，覆盖 Soldier 模型材质色）
-TEAM_TINT = {'red': (1.0, 0.55, 0.5), 'blue': (0.55, 0.68, 1.0)}
+# 人物模型：优先 panda3d 原生 BAM（含 24 条骨骼动画）。
+# 打包（PyInstaller）后 glTF 动画解析存在帧数断言兼容问题，BAM 由源码模式
+# 预转换（tools/build_char_bam.py），运行时不再依赖 gltf 解析器，加载更快更稳。
+CHAR_MODEL = ('characters/soldier.bam' if os.path.exists('characters/soldier.bam')
+              else 'characters/soldier.glb')
+
+# 队伍着色（RGB 0-1，用 >1 的亮度补偿深色制服贴图，远处也能分辨阵营）
+TEAM_TINT = {'red': (2.0, 1.05, 0.95), 'blue': (0.95, 1.3, 2.2)}
+TEAM_RING = {'red': (196, 74, 58), 'blue': (86, 132, 220)}
 
 DIFFICULTY = {
     'easy':   dict(label='简单', react=1.15, err=7.5, interval=0.85,
@@ -70,7 +78,7 @@ class Bot:
         self.anims = {}
         try:
             from direct.actor.Actor import Actor as PandaActor
-            self.actor = PandaActor('characters/soldier.glb')
+            self.actor = PandaActor(CHAR_MODEL)
             self.actor.reparentTo(self.root)
             mn, mx = self.actor.getTightBounds()
             self.actor.setPos(0, 0, -mn.z)
@@ -84,6 +92,11 @@ class Bot:
             self.anims.setdefault('idle', self.anims.get('idle_gun_pointing', 'Idle'))
             self.anims.setdefault('death', self.anims.get('death', 'Death'))
             self.actor.loop(self.anims['idle'])
+            # 脚下阵营色环（远处/逆光时也能一眼分辨敌我）
+            _ring = TEAM_RING.get(team, (200, 200, 200))
+            Entity(parent=self.root, model='quad', rotation_x=90,
+                   scale=(1.15, 1.15), y=0.04,
+                   color=color.rgba32(_ring[0], _ring[1], _ring[2], 110))
         except Exception as exc:
             print(f'[bot] {name} 模型加载失败，降级为方块:', exc)
             from ursina import destroy

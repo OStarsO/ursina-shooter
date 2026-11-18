@@ -1,39 +1,46 @@
 # -*- coding: utf-8 -*-
-"""游戏进程 ↔ 房间服务器的轻量实时通道。
+"""游戏进程 ↔ 房间服务器（权威世界）的实时通道。
 
-对局期间游戏进程通过 game_hello(token) 接入房主的 25250 服务：
-  上行：
-    {"t":"hit_claim","attacker","target","weapon","zone"}
-        —— 玩家击倒人机 / 人机击中玩家的命中声明（服务器按 anticheat
-           规则验证后才计入权威比分；本地模式无服务器时不发送）
-    {"t":"respawn_done"}   本机重生完成
-  下行：
-    {"t":"score_update", ...}   权威战绩（写回 score_queue 供主线程消费）
-    {"t":"claim_reject","reason"}  被拒绝的声明（显示给玩家）
+上行（客户端 → 服务端）
+    {"t":"state","pos":[x,y,z],"yaw":..,"pitch":..,"weapon":"ak","alive":true}
+        20Hz 节流（send_state 内部保证最小间隔 50ms）
+    {"t":"fire","origin":[x,y,z],"dir":[x,y,z]}
+        每次开火一条；命中/伤害/死亡全部由服务端弹道计算
+    {"t":"respawn_done"}  本机重生完成（兼容旧协议）
 
-线程模型：socket 收发在后台线程，主线程通过 score_queue 轮询取事件，
-不阻塞 ursina 渲染循环。断线自动静默（本地练习不受影响）。
+下行（服务端 → 客户端）
+    {"t":"snapshot", ...}   15Hz 权威快照：实体、血量、比分、事件、结算
+    {"t":"result", ...}     回合结算
+    {"t":"cmd_apply", ...}  房主作弊指令（god/speed/damage/ammo_inf/kill/tp/respawn）
+    {"t":"start"/"lobby"/"closed"}
+
+线程模型：socket 收在后台线程 → inbox 队列；主线程每帧 drain，不阻塞渲染。
+断线静默降级（本地练习继续），不影响单机。
 """
 
 import json
 import queue
 import socket
 import threading
+import time
 
 import room_net as RN
 
+STATE_INTERVAL = 0.05      # 20Hz
+
 
 class GameNet:
-    """对局内与房间服务器的连接（每次对局一个实例）。"""
-
     def __init__(self, host, port, token):
         self.host = host
         self.port = port
         self.token = token
-        self.score_queue = queue.Queue()
+        self.inbox = queue.Queue()
+        self.score_queue = self.inbox          # 兼容旧调用名
         self._sock = None
         self._run = False
+        self._last_state = 0.0
 
+    # ---------------- 连接 ----------------
     def start(self):
         try:
             self._sock = socket.create_connection((self.host, self.port), timeout=4.0)
@@ -52,7 +59,6 @@ class GameNet:
             pass
 
     # ---------------- 上行 ----------------
-
     def _send(self, obj):
         if not self._run or self._sock is None:
             return
@@ -61,16 +67,29 @@ class GameNet:
         except OSError:
             self._run = False
 
-    def hit_claim(self, attacker_id, target_id, weapon, zone):
-        """上报一条命中声明（服务器验证后才计分）。"""
-        self._send({"t": "hit_claim", "attacker": int(attacker_id),
-                    "target": int(target_id), "weapon": weapon, "zone": zone})
+    def send_state(self, pos, yaw, pitch, weapon, alive, firing=False):
+        """20Hz 节流上送自身状态（内部限流，调用方可以每帧调）。"""
+        now = time.time()
+        if now - self._last_state < STATE_INTERVAL:
+            return
+        self._last_state = now
+        self._send({
+            "t": "state",
+            "pos": [round(float(pos[0]), 2), round(float(pos[1]), 2),
+                    round(float(pos[2]), 2)],
+            "yaw": round(float(yaw), 1), "pitch": round(float(pitch), 1),
+            "weapon": weapon, "alive": bool(alive), "firing": bool(firing),
+        })
+
+    def send_fire(self, origin, direction):
+        self._send({"t": "fire",
+                    "origin": [round(float(v), 2) for v in origin],
+                    "dir": [round(float(v), 4) for v in direction]})
 
     def respawn_done(self):
         self._send({"t": "respawn_done"})
 
     # ---------------- 下行 ----------------
-
     def _loop(self):
         try:
             self._sock.settimeout(None)
@@ -89,10 +108,19 @@ class GameNet:
                 except ValueError:
                     continue
                 kind = msg.get("t")
-                if kind in ("score_update", "claim_reject", "lobby", "closed"):
-                    self.score_queue.put(msg)
+                self.inbox.put(msg)
                 if kind in ("lobby", "closed"):
                     break
         except (OSError, ValueError):
             pass
         self._run = False
+
+    # ---------------- 便捷读取 ----------------
+    def drain(self, limit=200):
+        out = []
+        for _ in range(limit):
+            try:
+                out.append(self.inbox.get_nowait())
+            except queue.Empty:
+                break
+        return out

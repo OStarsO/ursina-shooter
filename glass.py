@@ -32,6 +32,9 @@ void main() {
 }
 '''
 
+# 画质档位可关闭毛玻璃（低配机省一次全屏低分辨率渲染）
+ENABLED = True
+
 _FRAG = '''
 uniform sampler2D k_scene;
 uniform vec2 k_win_size;
@@ -151,6 +154,8 @@ def layer():
 def glass_quad(parent, w, h, x=0.0, y=0.0, z=0.0, alpha=0.80,
                tint=(0.32, 0.35, 0.41)):
     """毛玻璃底 quad。返回 None 表示毛玻璃不可用，调用方应退化为纯色。"""
+    if not ENABLED:
+        return None
     lay = layer()
     if lay is None:
         return None

@@ -49,11 +49,12 @@ from app_style import (
 )
 import room_net as rn
 import net_ui
+import updater
 
 # ============================ 基础常量 ============================
 
 APP_NAME = "射击启动器"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # 打包成 windowed exe 后没有控制台，sys.stdout/stderr 为 None，print 会抛 AttributeError
 if sys.stdout is None:
@@ -63,6 +64,9 @@ if sys.stderr is None:
 
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+
+# 自检出图模式：抑制所有会阻塞的弹窗（缺游戏文件 / 单实例提示等）
+SCREENSHOT_MODE = False
 
 # 数字 / 英文窄体（与游戏内同一套字体）
 FONT_DIR = BASE_DIR / "fonts"
@@ -700,8 +704,93 @@ class EnvProbeThread(QThread):
         self.done.emit({"ok": False, "error": "所有解释器都无法导入 ursina", "detail": failed})
 
 
+# ---- pip 镜像优选（国内网络优先镜像，超时/无响应自动回退官方源）----
+
+PIP_INDEX_CANDIDATES = (
+    ("清华镜像", "https://pypi.tuna.tsinghua.edu.cn/simple"),
+    ("阿里云镜像", "https://mirrors.aliyun.com/pypi/simple"),
+    ("腾讯云镜像", "https://mirrors.cloud.tencent.com/pypi/simple"),
+)
+PIP_OFFICIAL = ("官方 PyPI", "https://pypi.org/simple")
+
+
+def probe_pip_index(index_url, timeout=5):
+    """快速探测某个 pip 镜像是否可用（请求 index 根页面，超时即判失败）。"""
+    try:
+        req = urllib.request.Request(
+            index_url.rstrip("/") + "/",
+            headers={"User-Agent": GAME_USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 500
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def pick_pip_index(on_log=None):
+    """按顺序探测镜像，返回 (标签, index_url, 是否镜像)；全失败回退官方源。"""
+    for label, url in PIP_INDEX_CANDIDATES:
+        if probe_pip_index(url):
+            if on_log:
+                on_log(f"使用{label}下载依赖：{url}")
+            return label, url, True
+        if on_log:
+            on_log(f"{label}无响应/超时，尝试下一个源")
+    if on_log:
+        on_log("镜像源全部不可用，回退官方 PyPI")
+    return PIP_OFFICIAL[0], PIP_OFFICIAL[1], False
+
+
+class UpdateCheckThread(QThread):
+    """后台查询 GitHub 最新 Release（不阻塞 UI）"""
+    done = Signal(bool, dict)
+
+    def __init__(self, timeout=10, parent=None):
+        super().__init__(parent)
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            release = updater.fetch_latest_release(timeout=self.timeout)
+        except updater.UpdateError as exc:
+            self.done.emit(False, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(False, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        self.done.emit(True, release)
+
+
+class UpdateDownloadThread(QThread):
+    """下载更新包并生成替换脚本"""
+    progress = Signal(int, int)
+    done = Signal(bool, str, str)      # ok / 说明 / 替换脚本路径
+
+    def __init__(self, release, parent=None):
+        super().__init__(parent)
+        self.release = release or {}
+
+    def run(self):
+        try:
+            asset = self.release.get("asset")
+            if not asset:
+                raise updater.UpdateError("最新版本没有附带 exe 更新包")
+            path = updater.download_asset(
+                asset, updater.stage_dir(),
+                on_progress=lambda d, t: self.progress.emit(d, t),
+            )
+            bat = updater.stage_self_update(path)
+        except updater.UpdateError as exc:
+            self.done.emit(False, str(exc), "")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(False, f"{type(exc).__name__}: {exc}", "")
+            return
+        self.done.emit(True, str(path), str(bat))
+
+
 class RepairThread(QThread):
-    """创建 .venv 并安装 ursina"""
+    """创建 .venv 并安装 ursina（镜像优先，失败回退官方 PyPI）"""
     line = Signal(str)
     done = Signal(bool, str)
 
@@ -722,6 +811,23 @@ class RepairThread(QThread):
                 self.line.emit(line)
         return proc.wait()
 
+    def _pip_install(self, python: Path, packages, upgrade=True):
+        """镜像优先安装；镜像失败（非零退出）自动回退官方 PyPI 重试一次。"""
+        label, index, mirrored = pick_pip_index(on_log=self.line.emit)
+        base = [str(python), "-m", "pip", "install",
+                "--disable-pip-version-check", "--timeout", "20", "--retries", "2"]
+        if upgrade:
+            base.append("-U")
+        args = base + ["-i", index] + list(packages)
+        self.line.emit(f"$ {' '.join(args)}")
+        code = self._run(args)
+        if code != 0 and mirrored:
+            self.line.emit(f"{label}安装失败（退出码 {code}），回退官方 PyPI 重试…")
+            args = base + ["-i", PIP_OFFICIAL[1]] + list(packages)
+            self.line.emit(f"$ {' '.join(args)}")
+            code = self._run(args)
+        return code
+
     def run(self):
         venv_dir = self.game_dir / ".venv"
         python = venv_dir / "Scripts" / "python.exe"
@@ -732,10 +838,11 @@ class RepairThread(QThread):
                 if code != 0:
                     self.done.emit(False, "创建虚拟环境失败")
                     return
-            self.line.emit("安装 ursina（可能需要几分钟）…")
-            code = self._run([str(python), "-m", "pip", "install", "-U", "pip", "ursina"])
-            if code != 0:
-                self.done.emit(False, "安装依赖失败，请检查网络")
+            self.line.emit("升级 pip（镜像优先）…")
+            self._pip_install(python, ["pip"])
+            self.line.emit("安装 ursina / panda3d（可能需要几分钟）…")
+            if self._pip_install(python, ["ursina"]) != 0:
+                self.done.emit(False, "安装依赖失败：镜像与官方源均不可用，请检查网络")
                 return
             info = probe_python(python, timeout=60)
             if info.get("ok"):
@@ -1200,6 +1307,8 @@ class LauncherWindow(QWidget):
         QTimer.singleShot(180, self.start_env_check)
         # 缺少游戏文件时，先让玩家选择目标路径再下载补齐
         QTimer.singleShot(900, self._prompt_missing_game)
+        # 启动后自动检查 GitHub 最新版本（失败静默，不打扰使用）
+        QTimer.singleShot(6000, lambda: self.check_update(auto=True))
 
     # ---------- 样式 ----------
     def _apply_global_style(self):
@@ -1952,6 +2061,9 @@ class LauncherWindow(QWidget):
         return self.open_game_setup(reason=tip)
 
     def _prompt_missing_game(self):
+        if SCREENSHOT_MODE:          # 自检出图时不要弹窗（会阻塞 grab）
+            self._refresh_game_row()
+            return
         if self.game_path.is_file():
             self._refresh_game_row()
             return
@@ -1998,6 +2110,16 @@ class LauncherWindow(QWidget):
                 self.lbl_status.setText("环境就绪 · 游戏文件缺失，请先下载补齐")
             self._refresh_game_row()
         else:
+            game_exe = self._find_game_exe()
+            if game_exe is not None:
+                # 打包版游戏自带运行时，不依赖本机 Python 环境
+                self.row_python.set_state("ok", f"打包版：{game_exe.name}")
+                self.row_engine.set_state("ok", "内置运行时（无需 Python）")
+                self.lbl_status.setText("环境就绪（打包版游戏）")
+                self.btn_launch.setEnabled(True)
+                self.btn_repair.setVisible(False)
+                self._refresh_game_row()
+                return
             self.row_python.set_state("bad", info.get("error", "不可用"))
             self.row_engine.set_state("bad", "未检测到 ursina")
             self.lbl_status.setText("环境异常，请点“修复环境”")
@@ -2157,7 +2279,9 @@ class LauncherWindow(QWidget):
 
     def _open_lobby(self, role, server=None, client=None, room_info=None):
         callbacks = {
-            "python_ready": lambda: bool(self.env.get("ok")) or bool(self.cfg.get("last_good_python")),
+            "python_ready": lambda: bool(self.env.get("ok"))
+            or bool(self.cfg.get("last_good_python"))
+            or (self._find_game_exe() is not None),
             "launch_game": self.launch_online_game,
             "on_leave": self._on_lobby_closed,
         }
@@ -2194,37 +2318,71 @@ class LauncherWindow(QWidget):
     def launch_online_game(self, extra_args, tag, on_finished):
         return self.start_game(extra_args=extra_args, tag=tag, on_finished=on_finished)
 
-    def start_game(self, extra_args=None, tag="game", on_finished=None):
-        python = self.env.get("python_path") or self.cfg.get("last_good_python")
-        if not python:
-            QMessageBox.warning(self, "无法启动", "未找到可用的 Python 环境，请先点“修复环境”。")
-            return False
-        if not self.game_path.is_file() and not self.ensure_game_files():
-            return False
-        if not self.game_path.is_file():
-            QMessageBox.warning(
-                self, "无法启动",
-                f"仍然找不到游戏文件：\n{self.game_path}\n\n"
-                "请点“设置 → 选择路径 / 下载游戏文件”重新补齐。",
-            )
-            return False
+    def _find_game_exe(self):
+        """查找打包好的游戏 exe（存在则无需 Python 环境）。"""
+        candidates = [
+            self.game_dir / "射击.exe",
+            self.game_dir / "射击" / "射击.exe",
+            BASE_DIR / "射击.exe",
+            BASE_DIR / "射击" / "射击.exe",
+            BASE_DIR / "dist" / "射击" / "射击.exe",
+            BASE_DIR / "dist_game" / "射击" / "射击.exe",
+        ]
+        for path in candidates:
+            try:
+                if path.is_file():
+                    return path
+            except OSError:
+                continue
+        return None
 
-        args = [str(self.game_path)] + list(extra_args or [])
+    def start_game(self, extra_args=None, tag="game", on_finished=None):
+        game_exe = self._find_game_exe()
+        python = self.env.get("python_path") or self.cfg.get("last_good_python")
+        extra = list(extra_args or [])
+
+        if game_exe is not None:
+            # 打包版：直接启动 exe，资源在 exe 同级目录（无需 Python）
+            program = str(game_exe)
+            args = extra
+            workdir = str(game_exe.parent)
+            desc = f'"$ {game_exe}" {" ".join(extra)}'.strip()
+        else:
+            if not python:
+                QMessageBox.warning(
+                    self, "无法启动",
+                    "未找到可用的 Python 环境，也没有打包好的游戏 exe。\n"
+                    "请先点“修复环境”，或下载打包版游戏。")
+                return False
+            if not self.game_path.is_file() and not self.ensure_game_files():
+                return False
+            if not self.game_path.is_file():
+                QMessageBox.warning(
+                    self, "无法启动",
+                    f"仍然找不到游戏文件：\n{self.game_path}\n\n"
+                    "请点“设置 → 选择路径 / 下载游戏文件”重新补齐。",
+                )
+                return False
+            program = str(python)
+            args = [str(self.game_path)] + extra
+            workdir = str(self.game_dir)
+            desc = f'$ {python} "{self.game_path.name}" {" ".join(extra)}'
+
         self._game_finished_cb = on_finished
         self._game_tag = tag
 
         self._switch_page("console")
         self.log_box.setVisible(True)
         self.log_box.clear()
-        self.log_box.append_line(f"$ {python} \"{self.game_path.name}\" {' '.join(extra_args or [])}")
+        self.log_box.append_line(desc)
         self.log_dir().mkdir(parents=True, exist_ok=True)
         log_name = "latest.log" if tag == "game" else f"{tag}.log"
         self._log_file = open(self.log_dir() / log_name, "w", encoding="utf-8")
 
         self.game_proc = QProcess(self)
-        self.game_proc.setProgram(python)
+        self.game_proc.setProgram(program)
         self.game_proc.setArguments(args)
-        self.game_proc.setWorkingDirectory(str(self.game_dir))
+        self.game_proc.setWorkingDirectory(workdir)
         self.game_proc.setProcessChannelMode(QProcess.MergedChannels)
         self.game_proc.readyReadStandardOutput.connect(self._read_game_output)
         self.game_proc.finished.connect(self._on_game_finished)
@@ -2374,22 +2532,117 @@ class LauncherWindow(QWidget):
             pass
 
     # ---------- 更新 ----------
-    def check_update(self):
-        url = (self.cfg.get("update_url") or "").strip()
-        if not url:
-            self.flash_status("未配置更新源（可在 config.json 设置 update_url）")
+    def check_update(self, auto=False):
+        """检查 GitHub 最新 Release。auto=True 时静默失败（启动自动检查）。
+
+        有更新时：打包运行 → 询问后下载并自动替换重启；
+        源码运行 → 只提示新版本与发布页（不替换开发目录）。
+        """
+        if getattr(self, "_update_thread", None) is not None \
+                and self._update_thread.isRunning():
             return
+        self._update_auto = bool(auto)
+        self._latest_release = None
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("检查中…")
         self.lbl_status.setText("正在检查更新…")
+        self._update_thread = UpdateCheckThread(self)
+        self._update_thread.done.connect(self._on_update_checked)
+        self._update_thread.start()
+
+    def _log_update(self, text):
         try:
-            with urllib.request.urlopen(url, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            latest = str(data.get("version", "")).strip()
-            if latest and latest != APP_VERSION:
-                self.flash_status(f"发现新版本 {latest}（当前 {APP_VERSION}）")
+            if getattr(self, "log_box", None) is not None:
+                self.log_box.append_line(f"[更新] {text}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_update_checked(self, ok, payload):
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("检查更新")
+        if not ok:
+            msg = payload.get("error", "未知错误")
+            self._log_update(f"检查失败：{msg}")
+            if getattr(self, "_update_auto", False):
+                self.lbl_status.setText("就绪")
             else:
-                self.flash_status(f"已是最新版本 {APP_VERSION}")
-        except Exception as exc:  # noqa: BLE001
-            self.flash_status(f"更新检查失败：{type(exc).__name__}")
+                self.flash_status(f"更新检查失败：{msg}", 6000)
+            return
+        self._latest_release = payload
+        latest = payload.get("version", "")
+        if not updater.is_newer(latest, APP_VERSION):
+            self._log_update(f"已是最新版本 v{APP_VERSION}")
+            self.lbl_status.setText(f"已是最新版本 v{APP_VERSION}")
+            if not getattr(self, "_update_auto", False):
+                self.flash_status(f"已是最新版本 v{APP_VERSION}")
+            return
+        self._log_update(f"发现新版本 v{latest}（当前 v{APP_VERSION}）")
+        self.lbl_status.setText(f"发现新版本 v{latest}")
+        self._offer_update(payload)
+
+    def _offer_update(self, release):
+        latest = release.get("version", "")
+        notes = (release.get("notes") or "").strip()
+        if len(notes) > 700:
+            notes = notes[:700] + "…"
+        if not updater.is_frozen():
+            QMessageBox.information(
+                self, "发现新版本",
+                f"检测到新版本 v{latest}（当前 v{APP_VERSION}）。\n\n"
+                f"当前为源码运行模式，不执行自动替换。\n"
+                f"发布页：{release.get('html_url', '')}",
+            )
+            return
+        text = (f"检测到新版本 v{latest}（当前 v{APP_VERSION}）。\n\n"
+                f"{notes}\n\n是否立即下载并自动更新？")
+        if QMessageBox.question(self, "发现新版本", text,
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.Yes) != QMessageBox.Yes:
+            self.flash_status(f"已跳过更新 v{latest}")
+            return
+        self._start_update_download(release)
+
+    def _start_update_download(self, release):
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("下载中…")
+        self.lbl_status.setText("正在下载更新…")
+        self._update_thread = UpdateDownloadThread(release, self)
+        self._update_thread.progress.connect(self._on_update_progress)
+        self._update_thread.done.connect(self._on_update_downloaded)
+        self._update_thread.start()
+
+    def _on_update_progress(self, done, total):
+        if total:
+            pct = min(100, done * 100 // max(1, total))
+            self.lbl_status.setText(
+                f"正在下载更新… {pct}%（{done // 1048576}/{total // 1048576} MB）")
+        else:
+            self.lbl_status.setText(f"正在下载更新… {done // 1024} KB")
+
+    def _on_update_downloaded(self, ok, message, bat_path):
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("检查更新")
+        if not ok:
+            self._log_update(f"下载失败：{message}")
+            self.flash_status(f"更新失败：{message}", 6000)
+            QMessageBox.warning(self, "更新失败", message)
+            return
+        self._log_update(f"更新包已就绪：{message}")
+        if QMessageBox.question(
+                self, "更新就绪",
+                "更新包已下载完成，客户端将自动重启以完成更新。\n\n现在重启？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes) != QMessageBox.Yes:
+            self.flash_status("更新包已下载，可稍后重启完成更新")
+            return
+        if updater.run_update_script(bat_path):
+            self.close()
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+        else:
+            QMessageBox.warning(self, "无法自动重启",
+                                f"请手动运行更新脚本：\n{bat_path}")
 
     # ---------- 状态提示 ----------
     def flash_status(self, text, msec=3200):
@@ -2531,6 +2784,8 @@ def _pump(app, frames=160, delay=0.03):
 
 
 def run_screenshot(path):
+    global SCREENSHOT_MODE
+    SCREENSHOT_MODE = True
     app = QApplication.instance() or QApplication(sys.argv)
     win = LauncherWindow(nickname="Ghost_07")
     win.show()

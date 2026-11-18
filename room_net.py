@@ -44,6 +44,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import anticheat as AC
+import cover_map
+import netsim
 
 ROOM_PORT = 25250
 PROTO_VERSION = 1
@@ -208,6 +210,11 @@ class RoomService:
         self._listen_thread = None
         self.host_member = self._add_member(nickname, "red", host=True, addr="127.0.0.1")
         self.anticheat = AC.AntiCheat()      # 服务器端命中验证（对局期使用）
+        self.world = None                    # netsim.World（服务端权威世界）
+        self._world_thread = None
+        self._world_stop = False
+        self._tick_count = 0
+        self._result_deadline = None
 
     # ---------- 生命周期 ----------
 
@@ -230,6 +237,8 @@ class RoomService:
         if not self._running:
             return
         self._running = False
+        self._world_stop = True
+        self.world = None
         with self._lock:
             conns = list(self._conns.values()) + list(self._game_conns.values())
             self._conns.clear()
@@ -362,6 +371,9 @@ class RoomService:
         conn.settimeout(None)
         try:
             send_msg(conn, {"t": "game_welcome"})
+            # 中途接入也要立刻拿到当前世界状态（开局瞬间重连/晚加入）
+            if self.world is not None:
+                send_msg(conn, self.world.snapshot())
         except OSError:
             return
         self.broadcast({"t": "members", "members": self.member_list()})
@@ -375,7 +387,17 @@ class RoomService:
                 except ValueError:
                     continue
                 kind = data.get("t")
-                if kind == "hit_claim":
+                if kind == "state":
+                    if self.world is not None:
+                        self.world.set_state(member["id"], data)
+                elif kind == "fire":
+                    if self.world is not None:
+                        try:
+                            self.world.fire(member["id"], data.get("origin"),
+                                            data.get("dir"))
+                        except (TypeError, ValueError):
+                            pass
+                elif kind == "hit_claim":
                     self._handle_hit_claim(member, data)
                 elif kind == "respawn_done":
                     now = time.time()
@@ -462,6 +484,16 @@ class RoomService:
             except OSError:
                 pass
 
+    def send_game(self, obj):
+        """只发给游戏进程（快照高频消息不能刷大厅连接）。"""
+        with self._lock:
+            conns = list(self._game_conns.values())
+        for conn in conns:
+            try:
+                send_msg(conn, obj)
+            except OSError:
+                pass
+
     def _console_broadcast(self, text):
         self.broadcast({"t": "console", "text": text})
         self.events.put(("console", text))
@@ -492,18 +524,74 @@ class RoomService:
                 "players": [dict(self._member_public(m), token=m["token"]) for m in self.members.values()],
                 "started_at": time.time(),
             }
-        self.broadcast({"t": "start", "game": game}, to_game=False)
+        self.broadcast({"t": "start", "game": game}, to_game=True)
         self.events.put(("game_started", game))
+        self._start_world(game)
         return game, ""
 
+    # ---------- 服务端权威世界 ----------
+
+    def _start_world(self, game):
+        member_list = []
+        with self._lock:
+            for m in self.members.values():
+                member_list.append({
+                    "id": m["id"], "nickname": m["nickname"], "team": m["team"],
+                    "is_bot": m["is_bot"], "difficulty": m.get("difficulty", "normal"),
+                })
+        self.world = netsim.World(
+            member_list,
+            mode=game.get("mode", "team5"),
+            score_target=game.get("score_target") or 0,
+            time_limit=game.get("time_limit") or 0,
+        )
+        self._world_stop = False
+        self._tick_count = 0
+        self._result_deadline = None
+        self._world_thread = threading.Thread(target=self._world_loop, daemon=True)
+        self._world_thread.start()
+        self._console_broadcast("[系统] 服务端权威世界已启动（20Hz 模拟 / 15Hz 快照）")
+
+    def _world_loop(self):
+        last = time.time()
+        while not self._world_stop and self.world is not None:
+            time.sleep(0.02)
+            now = time.time()
+            dt = min(0.1, max(0.0, now - last))
+            last = now
+            world = self.world
+            if world is None:
+                break
+            try:
+                world.tick(dt)
+            except Exception as exc:  # noqa: BLE001
+                print("[world] tick error:", exc)
+                continue
+            self._tick_count += 1
+            if self._tick_count % 4 == 0:            # ≈15Hz 快照
+                self.send_game(world.snapshot())
+            if world.result:
+                if self._result_deadline is None:
+                    self._result_deadline = now + netsim.RESULT_HOLD
+                    self.send_game({"t": "result", "result": world.result})
+                elif now >= self._result_deadline:
+                    self.end_game("对局结束，回到大厅")
+                    break
+            if self._tick_count % 20 == 0:           # ≈1Hz 大厅比分
+                with self._lock:
+                    self.room["score"] = dict(world.score)
+                self.broadcast({"t": "room_update", "room": self.public_room()})
+
     def end_game(self, reason="对局结束"):
+        self._world_stop = True
+        self.world = None
         with self._lock:
             if self.room["state"] == "lobby":
                 return False
             self.room["state"] = "lobby"
             for m in self.members.values():
                 m["in_game"] = False
-        self.broadcast({"t": "lobby", "reason": reason})
+        self.broadcast({"t": "lobby", "reason": reason}, to_game=True)
         self.events.put(("game_ended", reason))
         return True
 
@@ -741,7 +829,7 @@ class RoomService:
             if len(args) < 2 or args[0].lower() != "inf" or args[1].lower() not in ("on", "off"):
                 return False, "用法：ammo inf on|off"
             enabled = args[1].lower() == "on"
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "ammo_inf", "value": enabled}})
+            self._game_cmd({"name": "ammo_inf", "value": enabled})
             self._console_broadcast(f"[系统] 房主使用了作弊：无限弹药 {'开' if enabled else '关'}（全员）")
             return True, f"无限弹药已{'开启' if enabled else '关闭'}"
 
@@ -754,7 +842,7 @@ class RoomService:
                 return False, "倍数必须是数字"
             if not 0.1 <= mult <= 10:
                 return False, "倍数范围 0.1 – 10"
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "damage", "value": mult}})
+            self._game_cmd({"name": "damage", "value": mult})
             self._console_broadcast(f"[系统] 房主使用了作弊：全场伤害倍数 → ×{mult:g}")
             return True, f"全场伤害倍数 ×{mult:g}"
 
@@ -765,7 +853,7 @@ class RoomService:
                 sec = max(0, int(args[0]))
             except ValueError:
                 return False, "秒数必须是整数"
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "respawn", "value": sec}})
+            self._game_cmd({"name": "respawn", "value": sec})
             self._console_broadcast(f"[系统] 房主使用了作弊：重生时间 → {sec} 秒")
             return True, f"重生时间 {sec} 秒"
 
@@ -779,7 +867,7 @@ class RoomService:
 
         if cmd == "god" and args[0].lower() in ("off", "关"):
             names = [m["nickname"] for m in self.member_list()]
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "god", "target": names, "value": False}})
+            self._game_cmd({"name": "god", "target": names, "value": False})
             self._console_broadcast("[系统] 房主关闭了无敌（全员）")
             return True, "已关闭无敌"
 
@@ -797,7 +885,7 @@ class RoomService:
                 return False, "倍数必须是数字"
             if not 0.5 <= mult <= 5:
                 return False, "倍数范围 0.5 – 5"
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "speed", "target": names, "value": mult}})
+            self._game_cmd({"name": "speed", "target": names, "value": mult})
             self._console_broadcast(f"[系统] 房主使用了作弊：speed ×{mult:g}（对象：{who}）")
             return True, f"已下发 speed ×{mult:g} → {who}"
 
@@ -808,19 +896,50 @@ class RoomService:
                 x, z = float(args[1]), float(args[2])
             except ValueError:
                 return False, "坐标必须是数字"
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "tp", "target": names, "x": x, "z": z}})
+            self._game_cmd({"name": "tp", "target": names, "x": x, "z": z})
             self._console_broadcast(f"[系统] 房主传送了 {who} 到 ({x:g}, {z:g})")
             return True, f"已传送 {who}"
 
         if cmd == "kill":
-            self.broadcast({"t": "cmd_apply", "cmd": {"name": "kill", "target": names}})
+            self._game_cmd({"name": "kill", "target": names})
             self._console_broadcast(f"[系统] 房主秒杀了 {who}")
             return True, f"已秒杀 {who}"
 
         # god on
-        self.broadcast({"t": "cmd_apply", "cmd": {"name": "god", "target": names, "value": True}})
+        self._game_cmd({"name": "god", "target": names, "value": True})
         self._console_broadcast(f"[系统] 房主使用了作弊：无敌（对象：{who}）")
         return True, f"已下发无敌 → {who}"
+
+    # ---- 作弊指令下发（广播到游戏进程 + 同步服务端权威世界） ----
+
+    def _game_cmd(self, payload):
+        self.broadcast({"t": "cmd_apply", "cmd": payload}, to_game=True)
+        self._apply_world_cmd(payload)
+
+    def _apply_world_cmd(self, payload):
+        w = self.world
+        if w is None:
+            return
+        name = payload.get("name")
+        targets = payload.get("target")
+        ids = None
+        if targets is not None:
+            names = targets if isinstance(targets, list) else [targets]
+            ids = {m["id"] for m in self.members.values() if m["nickname"] in names}
+        if name == "god":
+            w.set_god(ids, bool(payload.get("value", True)))
+        elif name == "speed":
+            w.set_speed(ids, payload.get("value", 1.0))
+        elif name == "damage":
+            w.set_damage(payload.get("value", 1.0))
+        elif name == "respawn":
+            w.set_respawn(payload.get("value", 3))
+        elif name == "kill":
+            for mid in (ids or ()):
+                w.kill_now(mid)
+        elif name == "tp":
+            for mid in (ids or ()):
+                w.teleport(mid, payload.get("x", 0), payload.get("z", 0))
 
     # ---- 机器人 ----
 
