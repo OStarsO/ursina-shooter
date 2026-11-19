@@ -119,28 +119,52 @@ class PauseMenu(_Overlay):
         label(page, '设置', 20, x=-px(230), y=px(150), col=T.C_TEXT)
         label(page, 'SETTINGS', 11, x=-px(230), y=px(128), col=T.C_ACCENT)
 
-        self.rows = {}
-        self._setting_row(page, '灵敏度', 'sensitivity', px(100), step=5, lo=5, hi=200,
-                          fmt=lambda v: f'{int(v)}')
-        self._setting_row(page, '主音量', 'volume', px(62), step=0.05, lo=0.0, hi=1.0,
-                          fmt=lambda v: f'{v * 100:.0f}%')
-        self._setting_row(page, '音效音量', 'volume_sfx', px(24), step=0.05, lo=0.0, hi=1.0,
-                          fmt=lambda v: f'{v * 100:.0f}%')
-        self._setting_row(page, '界面音量', 'volume_ui', -px(14), step=0.05, lo=0.0, hi=1.0,
-                          fmt=lambda v: f'{v * 100:.0f}%')
-        self._cycle_row(page, '准星样式', 'crosshair', -px(52),
-                        [('cross', '十字'), ('dot', '圆点'), ('t', 'T 形'), ('thick', '粗十字')])
-        self._cycle_row(page, '画质档位', 'quality', -px(90),
-                        [('low', '低'), ('medium', '中'), ('high', '高')])
-        self._cycle_row(page, '分辨率', 'resolution', -px(128), None)
-        self._toggle_row(page, '全屏', 'fullscreen', -px(166))
-        self._toggle_row(page, '击杀者镜头', 'killcam', -px(200))
+        CROSS_CN = {'cross': '十字', 'dot': '圆点', 't': 'T 形', 'thick': '粗十字'}
+        SKIN_CN = {'default': '原版', 'digital': '数码迷彩', 'carbon': '碳纤维'}
+        cross_opts = [(v, CROSS_CN.get(v, v)) for v in
+                      (self.settings.get('unlocked_crosshair') or ['cross'])]
+        skin_opts = [(v, SKIN_CN.get(v, v)) for v in
+                     (self.settings.get('unlocked_skin') or ['default'])]
 
-    def _setting_row(self, page, title, key, y, *, step, lo, hi, fmt):
-        Entity(parent=page, model='quad', scale=(px(460), px(1)),
-               position=(0, y - px(21), -0.002), color=rgba(T.C_LINE_SOFT, 200))
-        label(page, title, 15, x=-px(230), y=y, col=T.C_TEXT_DIM)
-        val = label(page, '', 18, x=px(70), y=y, origin=(0.5, 0), col=T.C_TEXT, style='num')
+        self.rows = {}
+        LX, RX, W = -px(230), px(4), px(222)
+        # 左列：手感与音量
+        self._setting_row(page, '灵敏度', 'sensitivity', px(100), x0=LX, width=W,
+                          step=5, lo=5, hi=200, fmt=lambda v: f'{int(v)}')
+        self._setting_row(page, '主音量', 'volume', px(62), x0=LX, width=W,
+                          step=0.05, lo=0.0, hi=1.0, fmt=lambda v: f'{v * 100:.0f}%')
+        self._setting_row(page, '音效音量', 'volume_sfx', px(24), x0=LX, width=W,
+                          step=0.05, lo=0.0, hi=1.0, fmt=lambda v: f'{v * 100:.0f}%')
+        self._setting_row(page, '界面音量', 'volume_ui', -px(14), x0=LX, width=W,
+                          step=0.05, lo=0.0, hi=1.0, fmt=lambda v: f'{v * 100:.0f}%')
+        label(page, '准星/涂装随等级解锁', 11, x=LX, y=-px(52), col=T.C_TEXT_MUTE,
+              font=T.FONT_CJK)
+
+        # 右列：外观与画面
+        self._cycle_row(page, '准星样式', 'crosshair', px(100), x0=RX, width=W,
+                        options=cross_opts)
+        self._cycle_row(page, '武器涂装', 'skin', px(62), x0=RX, width=W,
+                        options=skin_opts)
+        self._cycle_row(page, '画质档位', 'quality', px(24), x0=RX, width=W,
+                        options=[('low', '低'), ('medium', '中'), ('high', '高')])
+        self._cycle_row(page, '分辨率', 'resolution', -px(14), x0=RX, width=W, options=None)
+        self._toggle_row(page, '全屏', 'fullscreen', -px(52), x0=RX, width=W)
+        self._toggle_row(page, '击杀者镜头', 'killcam', -px(90), x0=RX, width=W)
+
+        label(page, '改动立即生效并写入 settings.json（与启动器同源）', 11,
+              x=-px(230), y=-px(196), col=T.C_TEXT_MUTE, font=T.FONT_CJK)
+
+    def _row_base(self, page, title, y, x0, width):
+        Entity(parent=page, model='quad', scale=(width, px(1)),
+               position=(x0 + width / 2, y - px(19), -0.002),
+               color=rgba(T.C_LINE_SOFT, 200))
+        label(page, title, 14, x=x0, y=y, col=T.C_TEXT_DIM, font=T.FONT_CJK)
+
+    def _setting_row(self, page, title, key, y, *, step, lo, hi, fmt,
+                     x0=-px(230), width=px(460)):
+        self._row_base(page, title, y, x0, width)
+        val = label(page, '', 16, x=x0 + width * 0.66, y=y, origin=(0.5, 0),
+                    col=T.C_TEXT, style='num')
 
         def bump(delta):
             cur = float(self.settings.get(key, 0))
@@ -150,18 +174,16 @@ class PauseMenu(_Overlay):
             val.text = fmt(nv)
             self.on_setting(key, nv)
 
-        CsButton(page, px(34), px(34), x=px(120), y=y, text='−', size_px=18,
-                 align='center', on_click=lambda: bump(-1))
-        CsButton(page, px(34), px(34), x=px(160), y=y, text='+', size_px=18,
-                 align='center', on_click=lambda: bump(1))
+        CsButton(page, px(30), px(30), x=x0 + width - px(56), y=y, text='−',
+                 size_px=16, align='center', on_click=lambda: bump(-1))
+        CsButton(page, px(30), px(30), x=x0 + width - px(22), y=y, text='+',
+                 size_px=16, align='center', on_click=lambda: bump(1))
 
         val.text = fmt(float(self.settings.get(key, 0)))
         self.rows[key] = val
 
-    def _cycle_row(self, page, title, key, y, options):
-        Entity(parent=page, model='quad', scale=(px(460), px(1)),
-               position=(0, y - px(21), -0.002), color=rgba(T.C_LINE_SOFT, 200))
-        label(page, title, 15, x=-px(230), y=y, col=T.C_TEXT_DIM)
+    def _cycle_row(self, page, title, key, y, options, x0=-px(230), width=px(460)):
+        self._row_base(page, title, y, x0, width)
         if options is None:      # 分辨率：预设 + 当前值
             cur = str(self.settings.get(key) or '1600x900')
             presets = ['1280x720', '1600x900', '1920x1080', '2560x1440', '3840x2160']
@@ -173,21 +195,21 @@ class PauseMenu(_Overlay):
         cur = self.settings.get(key, values[0])
         if cur not in values:
             cur = values[0]
-        val = label(page, labels[cur], 16, x=px(70), y=y, origin=(0.5, 0),
+        val = label(page, labels[cur], 15, x=x0 + width * 0.62, y=y, origin=(0.5, 0),
                     col=T.C_TEXT, font=T.FONT_CJK)
 
         def step(delta):
-            nonlocal cur
+            nonlocal cur, values, labels
             i = (values.index(cur) + delta) % len(values)
             cur = values[i]
             self.settings[key] = cur
             val.text = labels[cur]
             self.on_setting(key, cur)
 
-        CsButton(page, px(34), px(34), x=px(120), y=y, text='‹', size_px=18,
-                 align='center', on_click=lambda: step(-1))
-        CsButton(page, px(34), px(34), x=px(160), y=y, text='›', size_px=18,
-                 align='center', on_click=lambda: step(1))
+        CsButton(page, px(30), px(30), x=x0 + width - px(56), y=y, text='‹',
+                 size_px=16, align='center', on_click=lambda: step(-1))
+        CsButton(page, px(30), px(30), x=x0 + width - px(22), y=y, text='›',
+                 size_px=16, align='center', on_click=lambda: step(1))
         self.rows[key] = val
 
     def _build_keybinds(self, cx, w, h):
@@ -269,13 +291,11 @@ class PauseMenu(_Overlay):
         val.text = fmt(cur)
         self.rows[key] = val
 
-    def _toggle_row(self, page, title, key, y):
-        Entity(parent=page, model='quad', scale=(px(460), px(1)),
-               position=(0, y - px(30), -0.002), color=rgba(T.C_LINE_SOFT, 200))
-        label(page, title, 16, x=-px(230), y=y, col=T.C_TEXT_DIM)
+    def _toggle_row(self, page, title, key, y, x0=-px(230), width=px(460)):
+        self._row_base(page, title, y, x0, width)
         # 这里会显示"开/关"，必须用中文字体，否则字形缺失会变成空白
-        val = label(page, '', 20, x=px(96), y=y, origin=(0.5, 0), col=T.C_TEXT,
-                    font=T.FONT_CJK)
+        val = label(page, '', 17, x=x0 + width * 0.62, y=y, origin=(0.5, 0),
+                    col=T.C_TEXT, font=T.FONT_CJK)
 
         def toggle():
             nv = not bool(self.settings.get(key, False))
@@ -283,8 +303,8 @@ class PauseMenu(_Overlay):
             val.text = '开' if nv else '关'
             self.on_setting(key, nv)
 
-        b = CsButton(page, px(84), px(40), x=px(168), y=y, text='切换', size_px=17,
-                     align='center', on_click=toggle)
+        CsButton(page, px(52), px(30), x=x0 + width - px(26), y=y, text='切换',
+                 size_px=14, align='center', on_click=toggle)
         val.text = '开' if self.settings.get(key) else '关'
         self.rows[key] = val
 
@@ -523,14 +543,20 @@ class ResultsPage(_Overlay):
             label(self.panel, name, 12, x=x, y=h / 2 - px(150), origin=origin, col=T.C_MUTED)
 
         self.rows_root = Entity(parent=self.panel)
-        self.mvp = label(self.panel, '', 16, x=-w / 2 + px(28), y=-h / 2 + px(86),
+        self.xp_line = label(self.panel, '', 15, x=-w / 2 + px(28), y=-h / 2 + px(132),
+                             col=T.C_OK, font=T.FONT_CJK)
+        self.level_line = label(self.panel, '', 14, x=-w / 2 + px(28), y=-h / 2 + px(112),
+                                col=T.C_ACCENT, font=T.FONT_CJK)
+        self.ach_line = label(self.panel, '', 13, x=-w / 2 + px(28), y=-h / 2 + px(92),
+                              col=T.C_TEXT_DIM, font=T.FONT_CJK)
+        self.mvp = label(self.panel, '', 16, x=-w / 2 + px(28), y=-h / 2 + px(66),
                          col=T.C_ACCENT, font=T.FONT_CJK)
-        self.btn_leave = CsButton(self.panel, px(220), px(48), x=px(0), y=-h / 2 + px(40),
+        self.btn_leave = CsButton(self.panel, px(220), px(44), x=px(0), y=-h / 2 + px(22),
                                   text='返回大厅', size_px=18, on_click=self._leave)
         self.hint = label(self.panel, '按 ESC 或点击返回大厅', 12, x=w / 2 - px(28),
-                          y=-h / 2 + px(34), origin=(0.5, 0), col=T.C_MUTED, font=T.FONT_CJK)
+                          y=-h / 2 + px(16), origin=(0.5, 0), col=T.C_MUTED, font=T.FONT_CJK)
 
-    def show_result(self, result, on_leave=None):
+    def show_result(self, result, on_leave=None, growth=None):
         if on_leave is not None:
             self.on_leave = on_leave
         result = result or {}
@@ -550,7 +576,7 @@ class ResultsPage(_Overlay):
             destroy(child)
         rows = result.get('rows') or []
         w, h = self.w, self.h
-        for i, row in enumerate(rows[:7]):
+        for i, row in enumerate(rows[:4]):
             y = h / 2 - px(186) - i * px(38)
             is_mvp = (result.get('mvp') or {}).get('name') == row.get('name')
             bg = Entity(parent=self.rows_root, model='quad',
@@ -572,6 +598,21 @@ class ResultsPage(_Overlay):
         mvp = result.get('mvp') or {}
         self.mvp.text = (f'MVP  {mvp.get("name", "—")}   ·   {mvp.get("score", 0)} 分'
                          if mvp else '')
+        if growth:
+            self.xp_line.text = (f"经验 +{growth.get('xp', 0)}   ·   "
+                                 f"Lv.{growth.get('level', 1)}（{growth.get('xp_text', '')}）"
+                                 f"   ·   总场次 {growth.get('matches', 0)}"
+                                 f"   胜率 {growth.get('win_rate', 0)}%")
+            lines = []
+            if growth.get('level_up'):
+                unlocked = '；'.join(u['text'] for u in growth.get('unlocks') or [])
+                lines.append(f"等级提升 → Lv.{growth['level']}" + (f"，解锁：{unlocked}" if unlocked else ''))
+            if growth.get('achievements'):
+                lines.append('本局成就：' + '、'.join(a['name'] for a in growth['achievements']))
+            self.level_line.text = lines[0] if lines else ''
+            self.ach_line.text = lines[1] if len(lines) > 1 else ''
+        else:
+            self.xp_line.text = self.level_line.text = self.ach_line.text = ''
         self.show()
 
     def _leave(self):

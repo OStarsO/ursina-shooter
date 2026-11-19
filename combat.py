@@ -157,6 +157,10 @@ class Melee:
     def reserve_text(self) -> str:
         return '—'                       # 近战无备弹概念（HUD 显示占位符）
 
+    @property
+    def infinite_reserve(self) -> bool:
+        return True                      # 近战同枪械一致：备弹视为无限
+
     def can_fire(self) -> bool:
         return self.cooldown <= 0.0
 

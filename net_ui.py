@@ -198,7 +198,11 @@ class TitleBar(QWidget):
 # ============================ 登录 ============================
 
 class LoginDialog(FramelessMixin, QDialog):
-    """启动后第一屏：游客登录（邮箱登录位预留）"""
+    """启动后第一屏：游客登录。
+
+    邮箱登录入口已移除：当前没有账号服务端，保留空入口只会误导玩家。
+    若后续接入云端账号，再以独立页签恢复（需要注册/登录/找回全流程）。
+    """
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
@@ -236,20 +240,18 @@ class LoginDialog(FramelessMixin, QDialog):
 
         root.addSpacing(6)
 
-        tabs = QHBoxLayout()
-        tabs.setSpacing(6)
-        self.tab_guest = QPushButton("游客登录")
-        self.tab_email = QPushButton("邮箱登录")
-        for btn, active in ((self.tab_guest, True), (self.tab_email, False)):
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(self._tab_qss(active))
-            tabs.addWidget(btn)
-        tabs.addStretch(1)
-        root.addLayout(tabs)
-
-        self.hint_email = QLabel("邮箱登录即将开放：后续版本支持注册/登录与云端存档")
-        self.hint_email.setObjectName("Hint")
-        root.addWidget(self.hint_email)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        pill = QLabel("游客登录")
+        pill.setStyleSheet(
+            f"QLabel{{background:{C_ACCENT_DIM}; border:1px solid {C_ACCENT};"
+            f"color:{C_TEXT}; border-radius:8px; padding:5px 14px; font-weight:600;}}")
+        row.addWidget(pill)
+        row.addStretch(1)
+        root.addLayout(row)
+        hint_local = QLabel("昵称与战绩保存在本机；云端账号功能尚未开放")
+        hint_local.setObjectName("Hint")
+        root.addWidget(hint_local)
 
         root.addSpacing(4)
         root.addWidget(self._label("昵称"))

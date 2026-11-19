@@ -63,12 +63,15 @@ def test_world_sync():
 
     # 上行状态 → 快照反映位置
     host_id = svc.host_member["id"]
-    gn.send_state((5, 0, -20), 90, 0, "ak", True)
-    time.sleep(0.4)
+    base_pos = list(svc.world.entities[host_id]["pos"])
+    # 小幅移动（0.6m < 单帧速度上限），验证状态确实进入权威世界
+    gn.send_state((base_pos[0] + 0.6, base_pos[1], base_pos[2]), 90, 0, "ak", True)
+    time.sleep(0.5)
     snaps = [m for m in gn.drain() if m.get("t") == "snapshot"]
     if snaps:
         me = next((e for e in snaps[-1]["entities"] if e["id"] == host_id), None)
-        check("客户端状态进入权威世界", me is not None and abs(me["pos"][0] - 5) < 1.5,
+        check("客户端状态进入权威世界",
+              me is not None and me["pos"][0] > base_pos[0] + 0.2,
               str(me and me["pos"]))
 
     # cmd_apply：god all 必须同时到达游戏进程与服务端世界

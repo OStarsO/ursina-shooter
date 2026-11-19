@@ -11,6 +11,7 @@
 """
 
 import math
+import time
 
 from ursina import Entity, Text, color, destroy
 
@@ -18,6 +19,15 @@ import ui_theme as T
 from bots import CHAR_MODEL, TEAM_RING, TEAM_TINT
 
 HP_W = 0.86
+LOOKAHEAD = 0.10          # 外推 100ms（补偿快照 15Hz 的间隔）
+MAX_PRED_SPEED = 12.0     # 外推速度上限（米/秒），超过视为瞬移不采用
+
+
+def extrapolate(pos, vel, horizon=LOOKAHEAD, max_speed=MAX_PRED_SPEED):
+    """按速度外推位置（纯函数，便于单测）：速度限幅后前进 horizon 秒。"""
+    vx = max(-max_speed, min(max_speed, float(vel[0])))
+    vz = max(-max_speed, min(max_speed, float(vel[1])))
+    return (pos[0] + vx * horizon, pos[1], pos[2] + vz * horizon)
 
 
 class RemoteActor:
@@ -86,15 +96,41 @@ class RemoteActor:
         self._dead_t = 0.0
         self._run_anim = False
         self._last_pos = tuple(self.root.position)
+        # 速度估计（用于 100ms 外推，缓解 15Hz 快照的顿挫/瞬移感）
+        self._vel = (0.0, 0.0)
+        self._snap_pos = tuple(self.root.position)
+        self._snap_t = time.time()
 
     # ------------------------------------------------------------------
     def apply(self, data, dt):
         target = tuple(data.get("pos") or self.root.position)
         cur = tuple(self.root.position)
-        k = min(1.0, dt * 12.0)
-        self.root.position = (cur[0] + (target[0] - cur[0]) * k,
-                              cur[1] + (target[1] - cur[1]) * k,
-                              cur[2] + (target[2] - cur[2]) * k)
+
+        # 1) 用相邻快照估计水平速度（EMA 平滑；瞬移尖峰不采用）
+        now = time.time()
+        gap = now - self._snap_t
+        if self._snap_pos is not None and 0.01 < gap < 0.8:
+            nvx = (target[0] - self._snap_pos[0]) / gap
+            nvz = (target[2] - self._snap_pos[2]) / gap
+            if math.hypot(nvx, nvz) <= 20.0:
+                self._vel = (self._vel[0] * 0.6 + nvx * 0.4,
+                             self._vel[1] * 0.6 + nvz * 0.4)
+            else:
+                self._vel = (0.0, 0.0)
+        self._snap_pos = target
+        self._snap_t = now
+
+        # 2) 外推 100ms 作为渲染目标；大跳变（传送/复活）直接对齐
+        pred = extrapolate(target, self._vel)
+        jump = math.dist((cur[0], cur[2]), (target[0], target[2]))
+        if jump > 8.0:
+            self.root.position = target
+            self._vel = (0.0, 0.0)
+        else:
+            k = min(1.0, dt * 12.0)
+            self.root.position = (cur[0] + (pred[0] - cur[0]) * k,
+                                  cur[1] + (pred[1] - cur[1]) * k,
+                                  cur[2] + (pred[2] - cur[2]) * k)
 
         # 最短路径转朝向
         target_yaw = float(data.get("yaw", self.root.rotation_y))
@@ -115,6 +151,7 @@ class RemoteActor:
             self.alive = alive
             if not alive:
                 self._dead_t = 0.0
+                self._vel = (0.0, 0.0)
                 self._play("death")
             else:
                 self._play("idle")

@@ -127,14 +127,18 @@ def test_bots():
     ticks(w, 40)
     moved = (abs(bot["pos"][0] - start[0]) + abs(bot["pos"][2] - start[2])) > 0.3
     check("机器人会移动/转向", moved, f"{start} → {tuple(bot['pos'])}")
-    # 把玩家摆到机器人面前，跑几秒应吃到伤害
-    place(w, 1, (w.entities[100]["pos"][0], 0, w.entities[100]["pos"][2] - 6))
+    # 固定到南侧开阔走廊（无遮挡），确保机器人能看到并开火
+    bot = w.entities[100]
+    bot["pos"] = [0.0, 0.0, -28.0]
+    bot["ai"]["waypoint"] = None
+    bot["yaw"] = 0.0
+    place(w, 1, (0.0, 0.0, -24.0))
     w.entities[1]["god"] = True
     hp0 = w.entities[1]["hp"]
     ticks(w, 80)
-    check("机器人会开火（god 挡伤仍产生事件）",
-          any(e.get("t") == "blocked" for e in w.events)
-          or w.entities[1]["hp"] < hp0)
+    fired = {e.get("t") for e in w.events if e.get("id") == 100 or e.get("attacker") == 100}
+    check("机器人会开火（射击/命中/挡伤事件）",
+          bool(fired & {"bot_shot", "hit", "blocked"}), str(fired))
     check("god 期间血量不下降", w.entities[1]["hp"] == hp0)
 
 
@@ -155,6 +159,27 @@ def test_cmd_effects():
     check("tp 生效", abs(w.entities[2]["pos"][0] - 12) < 0.01)
     w.kill_now(2)
     check("kill 指令生效", not w.entities[2]["alive"])
+
+
+def test_speed_cap():
+    w = make_world()
+    e = w.entities[1]
+    e["pos"] = [0.0, 0.0, 0.0]
+    e["_state_pos"] = (0.0, 0.0)
+    e["_state_t"] = w.seq_t()
+    w.set_state(1, {"pos": [0.0, 0.0, 0.0]})
+    ticks(w, 2)                                # 0.1 秒
+    w.set_state(1, {"pos": [6.0, 0.0, 0.0]})   # 60 m/s 瞬移
+    x = w.entities[1]["pos"][0]
+    check("超速被夹取", x < 6.0, f"x={x:.2f}")
+    check("产生 speed_warn 事件",
+          any(ev.get("t") == "speed_warn" for ev in w.events))
+    # 传送后首个状态不做速度校验
+    w.teleport(1, 30, 0)
+    ticks(w, 1)
+    w.set_state(1, {"pos": [32.0, 0.0, 0.0]})
+    check("传送落点不被误夹", abs(w.entities[1]["pos"][0] - 32.0) < 0.01,
+          str(w.entities[1]["pos"][0]))
 
 
 def test_snapshot():
@@ -179,6 +204,7 @@ def main():
     test_victory_and_time()
     test_bots()
     test_cmd_effects()
+    test_speed_cap()
     test_snapshot()
     print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
     if FAIL:

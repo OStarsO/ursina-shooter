@@ -39,6 +39,10 @@ class GameNet:
         self._sock = None
         self._run = False
         self._last_state = 0.0
+        # 发送队列：主线程只入队，独立线程 sendall（避免卡渲染帧）
+        self._out = queue.Queue(maxsize=512)
+        self._send_stop = False
+        self._sender = None
 
     # ---------------- 连接 ----------------
     def start(self):
@@ -48,24 +52,63 @@ class GameNet:
             print('[联机] 游戏通道连接失败（本地继续）:', exc)
             return False
         self._run = True
+        self._send_stop = False
         threading.Thread(target=self._loop, daemon=True).start()
+        self._sender = threading.Thread(target=self._sender_loop, daemon=True)
+        self._sender.start()
+        self._send({"t": "game_hello", "token": self.token})
         return True
 
     def stop(self):
         self._run = False
+        self._send_stop = True
+        try:
+            self._out.put_nowait(None)
+        except queue.Full:
+            pass
         try:
             self._sock.close()
         except (OSError, AttributeError):
             pass
 
-    # ---------------- 上行 ----------------
+    # ---------------- 上行（队列 + 独立发送线程） ----------------
     def _send(self, obj):
+        """主线程只入队；队列满时丢弃最旧的 state 消息，仍保证 fire/leave 能进。"""
         if not self._run or self._sock is None:
             return
         try:
-            RN.send_msg(self._sock, obj)
-        except OSError:
-            self._run = False
+            self._out.put_nowait(obj)
+            return
+        except queue.Full:
+            pass
+        if obj.get("t") == "state":
+            return                       # 旧的 state 已经足够，直接跳过本帧
+        try:
+            dropped = self._out.get_nowait()
+            if dropped is not None and dropped.get("t") == "fire":
+                self._out.put_nowait(dropped)   # fire 尽量别丢
+        except queue.Empty:
+            pass
+        except queue.Full:
+            pass
+        try:
+            self._out.put_nowait(obj)
+        except queue.Full:
+            pass
+
+    def _sender_loop(self):
+        while not self._send_stop:
+            try:
+                msg = self._out.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if msg is None:
+                break
+            try:
+                RN.send_msg(self._sock, msg)
+            except (OSError, AttributeError):
+                self._run = False
+                break
 
     def send_state(self, pos, yaw, pitch, weapon, alive, firing=False):
         """20Hz 节流上送自身状态（内部限流，调用方可以每帧调）。"""
@@ -93,7 +136,6 @@ class GameNet:
     def _loop(self):
         try:
             self._sock.settimeout(None)
-            RN.send_msg(self._sock, {"t": "game_hello", "token": self.token})
             reader = self._sock.makefile("r", encoding="utf-8", errors="replace")
             first = reader.readline()
             if not first or json.loads(first).get("t") != "game_welcome":

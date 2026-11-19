@@ -51,7 +51,14 @@
 - **阵亡面板**：击杀者、武器、命中部位（头/躯干/肢体）、伤害、死因（击杀/坠落）、
   重生倒计时；可选「击杀者镜头」把镜头切到击杀者身后（设置项，默认关）
 - **游戏内设置**：灵敏度、主/音效/界面音量分轨、准星四种样式（十字/圆点/T 形/粗十字）、
-  画质档位（可视距离 + 毛玻璃开关）、分辨率切换即时生效、全屏、六项键位自定义
+  画质档位（可视距离 + 毛玻璃开关）、分辨率切换即时生效、全屏、六项键位自定义；
+  与启动器写同一份 `settings.json`（同源，双向生效）
+- **成长系统（轻量）**：每局结算发 XP，12 级；升级解锁准星样式、武器涂装（数码迷彩/
+  碳纤维）、玩家臂章；14 个成就（首杀/三杀/五连杀/爆头王/百场老兵/常胜将军/MVP/
+  百人斩/全能选手/等级），达成时 HUD 横幅提示并在结算页展示；无经济/开箱/付费
+- **战绩落盘**：每局结束立即原子写入 `profile.json`（胜负、最近 20 局、总场次、胜率、
+  场均 KDA、各模式最佳、XP/等级/成就），并同步 legacy `scores.json`；
+  训练场按平局计，避免刷胜率
 - **CS:GO 风格 HUD**：左下血量/护甲、右下弹药与武器名、顶部比分与计时、左上雷达、右上击杀提示、底部按键提示条
 - **命中反馈**：绿色十字准星常驻；红色命中标记仅在子弹命中物体或敌人时短暂闪现
 - **音效**：每把武器使用**独立音色枪声**（USP 清脆短促 / 沙鹰厚重炮吼 / AK 连发
@@ -367,7 +374,9 @@ BAM 由 `tools/build_char_bam.py` 生成（打包后 glTF 动画解析在冻结�
 ├── dummies.py              # 木偶人训练靶：头/胸/躯干/四肢分部位判定、巡航与倒地重生
 ├── cover_map.py            # cube 拼装掩体地图：AABB 几何 + 出生点 + 场景构建（服务端共用）
 ├── netsim.py               # 服务端权威世界：机器人 AI / 弹道命中 / 血量 / 胜负 / 快照
-├── remote_actors.py        # 远端实体渲染：快照插值、队伍色/脚下色环、昵称血条、死亡动画
+├── remote_actors.py        # 远端实体渲染：快照插值 + 100ms 外推、队伍色环、昵称血条、死亡动画
+├── growth.py               # 成长：XP/等级/解锁/14 个成就（纯逻辑，可单测）
+├── docs/notices.json       # 远程公告数据（改这里即可热更新，无需重新打包）
 ├── bots.py                 # 人机：三档难度 AI（搜索/瞄准/高斯弹道）、阵营着色、击倒重生
 ├── maps/                   # duel_arena.glb + LICENSES.md（CC-BY 3.0 署名说明）
 ├── shop.py                 # 武器选择商店：开局弹出 + B 键呼出，主/副武器两栏，价格全部 0
@@ -386,7 +395,8 @@ BAM 由 `tools/build_char_bam.py` 生成（打包后 glTF 动画解析在冻结�
 ├── winfix.py               # 窗口状态保持补丁 + 输入法屏蔽（ImmAssociateContext）
 ├── tests_room.py           # 协议层测试：71 项（含反作弊 16 项 + 权威同步联调 8 项）
 ├── tests_update.py         # 自动更新测试：24 项（版本比较 / 资产选择 / 镜像回退 / 自替换脚本）
-├── tests_netsim.py         # 服务端权威世界测试：31 项（弹道/部位/射速/机器人/胜负/快照）
+├── tests_netsim.py         # 服务端权威世界测试：34 项（弹道/部位/射速/机器人/胜负/快照/限速）
+├── tests_growth.py         # 成长系统测试：39 项（XP/等级/成就/解锁/历史截断）
 ├── tests_ui.py             # 大厅端到端测试：17 项
 ├── tests_combat.py         # 数值系统测试：44 项（含分部位伤害倍率）
 ├── tests_weapons.py        # 武器配置 / 动画数学 / GLB 资源测试：55 项
@@ -409,7 +419,8 @@ python tests_combat.py  # 伤害与护甲公式、弹匣/换弹、回血、死�
 python tests_weapons.py # 武器配置/关键帧合法性/动画插值/GLB 结构/近战数值
 python tests_window.py  # 窗口拖动/缩放后鼠标锁定切换不再还原（含 bug 复现对照）
 python tests_update.py  # 自动更新：版本比较/资产筛选/镜像回退/替换脚本（无需联网）
-python tests_netsim.py  # 服务端权威世界：弹道/部位倍率/射速/机器人/胜负/快照（无需联网）
+python tests_netsim.py  # 服务端权威世界：弹道/部位倍率/射速/机器人/胜负/快照/限速（无需联网）
+python tests_growth.py  # 成长：XP/等级/成就/解锁/历史 20 局上限（无需联网）
 python 射击.py --selftest   # 游戏内 UI 与状态链路
 ```
 
@@ -418,7 +429,7 @@ python 射击.py --selftest   # 游戏内 UI 与状态链路
 ```
 启动器启动 6 秒后自动检查（也可在「我的」页手动点「检查更新」）
   → GET https://api.github.com/repos/OStarsO/ursina-shooter/releases/latest
-  → 解析 tag（v1.3.0）与资产列表，按语义化版本比较本地 APP_VERSION
+  → 解析 tag（v1.4.0）与资产列表，按语义化版本比较本地 APP_VERSION
   → 无更新：状态栏显示"已是最新版本"
   → 有更新：弹窗展示版本与更新说明
        打包运行：确认后下载 exe → 生成 _apply_update.bat → 退出 → 批处理
@@ -493,6 +504,56 @@ dist_game\射击\射击.exe --shot dist_game\shot.png --view third
 依赖关系：P0-1 依赖地图几何（P1-1）与服务端实体（P0-2）；P0-3/P1-3 依赖击杀来源
 （本地 AI 或 P0-1 的 kill 事件）；P1-4 相对独立，放最后避免与协议联调互相干扰。
 
+## 本轮改造清单（A-1 ~ A-6，v1.4.0）
+
+| 项 | 内容 | 主要落点 |
+|---|---|---|
+| A-1 结算立即落盘 | `end_match → _settle_match`：本局统计 → growth 结算 → 原子写 `profile.json`，不再依赖击杀时写盘；训练场按平局计（防刷胜率） | `射击.py`、`growth.py` |
+| A-2 战绩结构扩展 | 场次/胜负/胜率/场均 KDA/爆头/MVP/最高连杀/各模式最佳/最近 20 局/XP/等级/成就；legacy `scores.json` 同步 | `growth.py`、`launcher.py`「我的」页 |
+| A-3 控制台真实命令 | `help status version update launch open scores reset-settings repair sound join clear`，替换原三个占位 | `launcher.py` |
+| A-4 设置同源 | 启动器新增准星/画质/涂装/击杀者镜头/音效/界面音量；与游戏共用 `settings.json`（含 keymap 等非数值字段），切页重读 | `launcher.py`、`射击.py` |
+| A-5 公告热更新 | 拉 `docs/notices.json`（raw → jsDelivr → 镜像回退），缓存到 `%APPDATA%/ShootingLauncher/notices_cache.json`，离线回退缓存/内置 | `launcher.py`、`docs/notices.json` |
+| A-6 登录页收敛 | 移除无服务端支撑的邮箱登录占位入口，登录页仅游客 + 本地存档说明 | `launcher.py` |
+
+配套的成长与网络改动：`growth.py`（XP 12 级曲线、准星/涂装/臂章解锁、14 成就、HUD 横幅）；
+`remote_actors` 100ms 速度外推（EMA + 限速 + 大跳变对齐）；`netsim` 服务端限速（超限夹取 +
+`speed_warn` 下发 + 传送豁免）；`game_net` 发送队列 + 独立发送线程。
+
+## 成长与战绩存档
+
+```
+每局结束 end_match() → _settle_match()
+  ├─ 统计本局：击杀/死亡/爆头/最高连杀/MVP/时长（训练场按平局计）
+  ├─ growth.apply_match()：XP、等级、解锁、成就判定
+  ├─ save_profile()：profile.json 原子写入（退出/断电不丢本局）
+  └─ 结算页展示：比分/KDA/MVP + XP/等级/本局成就
+```
+
+`profile.json` 字段：`xp level matches wins losses draws kills deaths assists
+headshots mvps best_streak best_by_mode modes_played history[≤20] achievements skin
+armband updated`。启动器「我的」页、控制台 `scores` 命令与结算页读同一份数据。
+
+## 启动器控制台命令
+
+`help` `status` `version` `update` `launch [training|duel|team5|team10]`
+`open game|logs|config|dir` `scores` `reset-settings` `repair` `sound` `join` `clear`
+
+## 公告热更新
+
+公告默认从仓库 `docs/notices.json` 拉取（raw → jsDelivr → 镜像前缀依次回退），
+成功后缓存到 `%APPDATA%/ShootingLauncher/notices_cache.json`；离线时显示缓存，
+无缓存显示内置公告。改 `docs/notices.json` 并推送即可更新所有客户端，无需重新打包。
+`config.json` 的 `notice_url` 可覆盖默认地址（自建公告源）。
+
+## 网络稳健性
+
+- **远端外推**：`remote_actors` 用相邻快照估计速度（EMA 平滑），按 100ms 外推
+  渲染目标，限速 12m/s；大跳变（传送/复活）直接对齐，避免瞬移拖影。
+- **服务端限速**：客户端状态水平位移/时间超过 `8×speed_mult×1.6+2` 时夹取回上一位置，
+  记 `speed_hits` 并向该客户端下发 `speed_warn`（HUD 横幅提示），`tp` 后首帧豁免。
+- **非阻塞发送**：`game_net._send()` 改为入队（容量 512），独立发送线程执行 sendall；
+  队列满时丢弃旧 `state`、保 `fire`，主线程不再被网络阻塞。
+
 ## 已知限制
 
 - **自动更新只替换启动器自身**：打包版游戏本体（`射击.exe` + `_internal`）体积大且
@@ -505,6 +566,11 @@ dist_game\射击\射击.exe --shot dist_game\shot.png --view third
   但单机机器人不参与服务端比分。
 - 键位自定义覆盖 换弹/商店/检视/第三人称/计分板/暂停 六项；移动仍固定 WASD
   （FPC 内部控制）。
+- **邮箱登录入口已移除**：当前没有账号服务端，保留空页签会误导；账号/云存档接入后
+  再以完整注册-登录-找回流程恢复（`net_ui.LoginDialog` 已留注释说明）。
+- 训练场按平局计入战绩（无对手阵营），胜利/胜率只在单挑与团队模式累计。
+- 服务端速度校验只夹取水平位置，不覆盖瞄准精度/瞬狙等行为；外推仅用于表现，
+  命中判定始终以服务端弹道为准。
 - 游戏窗口内输入法已被摘除（无法输入中文）——游戏本身没有任何文本输入框，无实际影响。
 - 引擎对 Python 3.13+ 暂无 panda3d 轮子，请使用 3.11 / 3.12。
 

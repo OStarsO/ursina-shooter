@@ -50,11 +50,12 @@ from app_style import (
 import room_net as rn
 import net_ui
 import updater
+import growth
 
 # ============================ 基础常量 ============================
 
 APP_NAME = "射击启动器"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # 打包成 windowed exe 后没有控制台，sys.stdout/stderr 为 None，print 会抛 AttributeError
 if sys.stdout is None:
@@ -107,7 +108,16 @@ DEFAULT_GAME_SETTINGS = {
     "fullscreen": False,
     "sensitivity": 40.0,
     "volume": 1.0,
+    "volume_sfx": 1.0,
+    "volume_ui": 1.0,
+    "crosshair": "cross",
+    "quality": "medium",
+    "skin": "default",
+    "killcam": False,
+    "resolution": "",
+    "keymap": {},
 }
+
 
 # ============================ 游戏文件来源（GitHub） ============================
 # 客户端只带启动器本体，游戏本体（射击.py / 模块 / 资源）在首次运行或文件缺失时
@@ -117,6 +127,12 @@ GAME_REPO_OWNER = "OStarsO"
 GAME_REPO_NAME = "ursina-shooter"
 GAME_REPO_REF = "main"
 GAME_ENTRY_NAME = "射击.py"
+
+# 公告不在包里写死：默认拉仓库里的 docs/notices.json（改文件即可热更新）
+DEFAULT_NOTICE_URL = ("https://raw.githubusercontent.com/"
+                      f"{GAME_REPO_OWNER}/{GAME_REPO_NAME}/main/docs/notices.json")
+NOTICE_MIRROR_PREFIX = "https://gh-proxy.com/"
+NOTICE_CACHE = CONFIG_DIR / "notices_cache.json"
 
 GAME_USER_AGENT = (f"ShooterLauncher/{APP_VERSION} "
                    f"(+https://github.com/{GAME_REPO_OWNER}/{GAME_REPO_NAME})")
@@ -624,6 +640,18 @@ def read_scores(game_dir: Path) -> dict:
     return data
 
 
+def read_profile(game_dir: Path) -> dict:
+    """读取成长档案（profile.json）；缺失时返回默认结构。"""
+    try:
+        path = game_dir / "profile.json"
+        if path.is_file():
+            with open(path, "r", encoding="utf-8") as f:
+                return growth.normalize(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return growth.default_profile()
+
+
 def read_game_settings(game_dir: Path) -> dict:
     settings = dict(DEFAULT_GAME_SETTINGS)
     try:
@@ -632,9 +660,20 @@ def read_game_settings(game_dir: Path) -> dict:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if isinstance(raw, dict):
-                for key in settings:
-                    if key in raw and isinstance(raw[key], (int, float, bool)):
-                        settings[key] = raw[key]
+                for key, default in settings.items():
+                    if key not in raw:
+                        continue
+                    val = raw[key]
+                    if isinstance(default, bool):
+                        settings[key] = bool(val)
+                    elif isinstance(default, (int, float)) and \
+                            isinstance(val, (int, float)) and not isinstance(val, bool):
+                        settings[key] = val
+                    elif isinstance(default, str) and isinstance(val, str):
+                        settings[key] = val
+                    elif isinstance(default, dict) and isinstance(val, dict):
+                        settings[key] = {str(k): str(v) for k, v in val.items()
+                                         if isinstance(v, str) and v}
     except (OSError, ValueError):
         pass
     return settings
@@ -739,6 +778,50 @@ def pick_pip_index(on_log=None):
     if on_log:
         on_log("镜像源全部不可用，回退官方 PyPI")
     return PIP_OFFICIAL[0], PIP_OFFICIAL[1], False
+
+
+class NoticeThread(QThread):
+    """拉取远程公告 JSON（直连失败走镜像），失败时由调用方回退缓存。"""
+    done = Signal(bool, list, str)
+
+    def __init__(self, url, timeout=8, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.timeout = timeout
+
+    def run(self):
+        urls = [self.url]
+        if "raw.githubusercontent.com" in self.url:
+            # 备用 1：jsDelivr（国内可达性通常好于 raw）
+            tail = self.url.split("raw.githubusercontent.com/", 1)[-1]
+            parts = tail.split("/", 3)
+            if len(parts) == 4:
+                urls.append(f"https://cdn.jsdelivr.net/gh/"
+                            f"{parts[0]}/{parts[1]}@{parts[2]}/{parts[3]}")
+            # 备用 2：通用加速前缀
+            urls.append(NOTICE_MIRROR_PREFIX + self.url)
+        last = "未配置公告地址"
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": GAME_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                items = raw.get("notices") if isinstance(raw, dict) else raw
+                if not isinstance(items, list):
+                    raise ValueError("公告格式应为 [{date,title,body}]")
+                clean = []
+                for it in items[:12]:
+                    if isinstance(it, dict) and it.get("title"):
+                        clean.append({
+                            "date": str(it.get("date", ""))[:32],
+                            "title": str(it.get("title"))[:80],
+                            "body": str(it.get("body", ""))[:600],
+                        })
+                self.done.emit(True, clean, "ok")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = f"{type(exc).__name__}: {exc}"
+        self.done.emit(False, [], last)
 
 
 class UpdateCheckThread(QThread):
@@ -1603,6 +1686,8 @@ class LauncherWindow(QWidget):
         return scroll
 
     def _switch_page(self, key):
+        if key == "settings":
+            self._load_settings_into_ui(read_game_settings(self.game_dir))
         if key not in self.PAGE_KEYS:
             return
         self.stack.setCurrentIndex(self.PAGE_KEYS.index(key))
@@ -1631,19 +1716,99 @@ class LauncherWindow(QWidget):
         lay.setContentsMargins(24, 8, 26, 6)
         lay.setSpacing(12)
         card = Card("公告")
+        self.btn_notice = QPushButton("刷新公告")
+        self.btn_notice.setObjectName("Ghost")
+        self.btn_notice.setCursor(Qt.PointingHandCursor)
+        self.btn_notice.clicked.connect(self.refresh_notices)
+        card.head.addWidget(self.btn_notice)
         self.notice_layout = QVBoxLayout()
         self.notice_layout.setSpacing(12)
         card.content.addLayout(self.notice_layout)
         lay.addWidget(card)
         lay.addStretch(1)
-        for date, title, body in self.DEFAULT_NOTICES:
-            self._add_notice(date, title, body)
-        # 预留：cfg["notice_url"] 配置后可在此拉取远程公告并追加
+        self._notice_thread = None
+        self._render_notices(self._read_notice_cache(),
+                             "" if self._read_notice_cache() else "正在获取最新公告…")
+        QTimer.singleShot(600, self.refresh_notices)
         return self._wrap_page(page)
 
+    # ---------- 公告（远程配置，改 docs/notices.json 即可热更新） ----------
+    def notices_url(self):
+        return (self.cfg.get("notice_url") or "").strip() or DEFAULT_NOTICE_URL
+
+    @staticmethod
+    def _read_notice_cache():
+        try:
+            if NOTICE_CACHE.is_file():
+                with open(NOTICE_CACHE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items = data.get("items") if isinstance(data, dict) else data
+                if isinstance(items, list):
+                    return [it for it in items if isinstance(it, dict)]
+        except (OSError, ValueError):
+            pass
+        return []
+
+    @staticmethod
+    def _write_notice_cache(items):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(NOTICE_CACHE, "w", encoding="utf-8") as f:
+                json.dump({"updated": time.strftime("%Y-%m-%d %H:%M"),
+                           "items": items}, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def refresh_notices(self):
+        if self._notice_thread is not None and self._notice_thread.isRunning():
+            return
+        self.btn_notice.setEnabled(False)
+        self.btn_notice.setText("获取中…")
+        self._notice_thread = NoticeThread(self.notices_url(), 8, self)
+        self._notice_thread.done.connect(self._on_notices)
+        self._notice_thread.start()
+
+    def _on_notices(self, ok, items, message):
+        self.btn_notice.setEnabled(True)
+        self.btn_notice.setText("刷新公告")
+        if ok and items:
+            self._write_notice_cache(items)
+            self._render_notices(items, "")
+        elif ok and not items:
+            self._render_notices([], "远程公告为空，显示内置公告")
+            self._render_builtin()
+        else:
+            cache = self._read_notice_cache()
+            if cache:
+                self._render_notices(cache, f"离线：显示上次缓存（{message[:48]}）")
+            else:
+                self._render_notices([], f"获取失败，显示内置公告（{message[:48]}）")
+                self._render_builtin()
+
+    def _render_builtin(self):
+        for date, title, body in self.DEFAULT_NOTICES:
+            self._add_notice(date, title, body)
+
+    def _render_notices(self, items, note=""):
+        while self.notice_layout.count():
+            item = self.notice_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if note:
+            hint = QLabel(note)
+            hint.setObjectName("Hint")
+            hint.setWordWrap(True)
+            self.notice_layout.addWidget(hint)
+        for it in items:
+            self._add_notice(str(it.get("date", "")), str(it.get("title", "")),
+                             str(it.get("body", "")))
+
     def _add_notice(self, date, title, body):
-        box = QVBoxLayout()
-        box.setSpacing(3)
+        box = QWidget()
+        col = QVBoxLayout(box)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(3)
         head = QHBoxLayout()
         t = QLabel(title)
         t.setStyleSheet(f"color:{C_TEXT}; font-size:13px; font-weight:600;")
@@ -1655,9 +1820,9 @@ class LauncherWindow(QWidget):
         b = QLabel(body)
         b.setObjectName("Hint")
         b.setWordWrap(True)
-        box.addLayout(head)
-        box.addWidget(b)
-        self.notice_layout.addLayout(box)
+        col.addLayout(head)
+        col.addWidget(b)
+        self.notice_layout.addWidget(box)
 
     # ---------- 设置页 ----------
     def _build_settings_page(self):
@@ -1746,16 +1911,31 @@ class LauncherWindow(QWidget):
         self.lbl_sens.setStyleSheet(f"color:#D7E1EE; font-family:'{FONT_NUM}'; font-size:14px; font-weight:600;")
         grid.addWidget(self.lbl_sens, 1, 2)
 
-        grid.addWidget(self._label("音量"), 2, 0)
-        self.slider_vol = QSlider(Qt.Horizontal)
-        self.slider_vol.setRange(0, 100)
-        self.slider_vol.valueChanged.connect(self._on_vol_changed)
-        self.slider_vol.sliderReleased.connect(self.save_settings_from_ui)
-        grid.addWidget(self.slider_vol, 2, 1)
-        self.lbl_vol = QLabel("100%")
-        self.lbl_vol.setFixedWidth(44)
-        self.lbl_vol.setStyleSheet(f"color:#D7E1EE; font-family:'{FONT_NUM}'; font-size:14px; font-weight:600;")
-        grid.addWidget(self.lbl_vol, 2, 2)
+        # 音量分轨：主 / 音效 / 界面
+        self.slider_vol = self._volume_row(grid, 2, "主音量", "lbl_vol")
+        self.slider_sfx = self._volume_row(grid, 3, "音效音量", "lbl_sfx")
+        self.slider_ui = self._volume_row(grid, 4, "界面音量", "lbl_ui")
+
+        # 外观与画面（与游戏内设置同源）
+        grid.addWidget(self._label("准星样式"), 5, 0)
+        self.combo_cross = QComboBox()
+        self.combo_cross.currentIndexChanged.connect(self.save_settings_from_ui)
+        grid.addWidget(self.combo_cross, 5, 1)
+        grid.addWidget(self._label("画质档位"), 5, 2)
+        self.combo_quality = QComboBox()
+        for val, text in (("low", "低"), ("medium", "中"), ("high", "高")):
+            self.combo_quality.addItem(text, val)
+        self.combo_quality.currentIndexChanged.connect(self.save_settings_from_ui)
+        grid.addWidget(self.combo_quality, 5, 3)
+
+        grid.addWidget(self._label("武器涂装"), 6, 0)
+        self.combo_skin = QComboBox()
+        self.combo_skin.currentIndexChanged.connect(self.save_settings_from_ui)
+        grid.addWidget(self.combo_skin, 6, 1)
+        grid.addWidget(self._label("击杀者镜头"), 6, 2)
+        self.sw_killcam = ToggleSwitch()
+        self.sw_killcam.toggled.connect(self.save_settings_from_ui)
+        grid.addWidget(self.sw_killcam, 6, 3, Qt.AlignLeft)
 
         grid.setColumnStretch(1, 1)
         set_card.content.addLayout(grid)
@@ -1808,24 +1988,135 @@ class LauncherWindow(QWidget):
         lay.addLayout(quick)
         return self._wrap_page(page)
 
+    # ---------- 控制台命令（真实可用） ----------
+
+    CONSOLE_HELP = (
+        "help 显示本帮助",
+        "status 环境/路径/版本/战绩摘要",
+        "version 客户端版本与最新 Release",
+        "update 检查 GitHub 更新",
+        "launch [training|duel|team5|team10] 启动游戏",
+        "open game|logs|config|dir 打开目录或配置文件",
+        "scores 查看成长档案（等级/胜率/最近对局）",
+        "reset-settings 恢复游戏默认设置",
+        "repair 修复运行环境（镜像优先装依赖）",
+        "sound 补齐音效",
+        "join 打开加入房间对话框",
+        "clear 清空控制台",
+    )
+
     def _run_local_command(self):
         text = self.console_input.text().strip()
         if not text:
             return
         self.console_input.clear()
         self.log_box.append_line(f"> {text}")
-        cmd = text.partition(" ")[0].lower()
-        if cmd == "help":
-            self.log_box.append_line("可用命令：help　status（环境摘要）　clear（清空控制台）")
-        elif cmd == "status":
-            py = self.env.get("python_path") or self.cfg.get("last_good_python") or "未检测到"
-            self.log_box.append_line(f"环境：{'就绪' if self.env.get('ok') else '未就绪'}")
-            self.log_box.append_line(f"解释器：{py}")
-            self.log_box.append_line(f"游戏路径：{self.game_path}")
-        elif cmd == "clear":
-            self.log_box.clear()
-        else:
-            self.log_box.append_line(f"未知命令：{cmd}（输入 help 查看）")
+        parts = text.split()
+        cmd, args = parts[0].lower(), parts[1:]
+        try:
+            if cmd == "help":
+                for line in self.CONSOLE_HELP:
+                    self.log_box.append_line("  " + line)
+            elif cmd == "clear":
+                self.log_box.clear()
+            elif cmd == "status":
+                self._cmd_status()
+            elif cmd == "version":
+                self._cmd_version()
+            elif cmd == "update":
+                self.check_update()
+                self.log_box.append_line("  已发起更新检查，结果见状态栏/弹窗")
+            elif cmd == "launch":
+                mode = args[0] if args else "training"
+                if mode not in ("training", "duel", "team5", "team10"):
+                    self.log_box.append_line("  模式：training / duel / team5 / team10")
+                else:
+                    self.log_box.append_line(f"  启动游戏：{mode}")
+                    self.start_game(extra_args=["--mode", mode])
+            elif cmd == "open":
+                self._cmd_open(args[0] if args else "dir")
+            elif cmd == "scores":
+                self._cmd_scores()
+            elif cmd == "reset-settings":
+                self.reset_settings()
+                self.log_box.append_line("  已恢复默认设置")
+            elif cmd == "repair":
+                self.repair_env()
+                self.log_box.append_line("  已开始修复环境")
+            elif cmd == "sound":
+                self.generate_sound()
+                self.log_box.append_line("  已补齐音效")
+            elif cmd == "join":
+                self.log_box.append_line("  打开加入房间…")
+                self.join_room()
+            else:
+                self.log_box.append_line(f"未知命令：{cmd}（输入 help 查看）")
+        except Exception as exc:  # noqa: BLE001
+            self.log_box.append_line(f"命令执行出错：{type(exc).__name__}: {exc}")
+
+    def _cmd_status(self):
+        env_ok = "就绪" if self.env.get("ok") else "未就绪"
+        py = self.env.get("python_path") or self.cfg.get("last_good_python") or "未检测到"
+        self.log_box.append_line(f"  环境：{env_ok}")
+        self.log_box.append_line(f"  解释器：{py}")
+        self.log_box.append_line(f"  游戏路径：{self.game_path}")
+        self.log_box.append_line(f"  客户端：v{APP_VERSION} · 昵称 {self.nickname}")
+        rel = getattr(self, "_latest_release", None)
+        if rel:
+            self.log_box.append_line(f"  最新版本：v{rel.get('version')}")
+        prof = growth.summary(read_profile(self.game_dir))
+        self.log_box.append_line(
+            f"  战绩：Lv.{prof['level']} · {prof['matches']} 场 · "
+            f"胜率 {prof['win_rate']}% · KDA {prof['avg_kda']}")
+
+    def _cmd_version(self):
+        self.log_box.append_line(f"  客户端版本：v{APP_VERSION}（{APP_NAME}）")
+        try:
+            rel = updater.fetch_latest_release(timeout=8)
+            newer = updater.is_newer(rel.get("version", ""), APP_VERSION)
+            self.log_box.append_line(
+                f"  GitHub 最新：v{rel.get('version')}"
+                + ("（有新版本）" if newer else "（已是最新）"))
+        except updater.UpdateError as exc:
+            self.log_box.append_line(f"  查询失败：{exc}")
+
+    def _cmd_open(self, what):
+        targets = {
+            "game": self.game_dir,
+            "dir": self.game_dir,
+            "logs": self.log_dir(),
+            "config": CONFIG_DIR,
+        }
+        if what == "config" and CONFIG_FILE.is_file():
+            self._open_path(CONFIG_FILE)
+            self.log_box.append_line(f"  已打开 {CONFIG_FILE}")
+            return
+        path = targets.get(what)
+        if path is None:
+            self.log_box.append_line("  用法：open game|logs|config|dir")
+            return
+        self._open_path(path)
+        self.log_box.append_line(f"  已打开 {path}")
+
+    def _cmd_scores(self):
+        prof = growth.summary(read_profile(self.game_dir))
+        self.log_box.append_line(
+            f"  等级 Lv.{prof['level']} · XP {prof['xp']}（{prof['xp_text']}）")
+        self.log_box.append_line(
+            f"  {prof['matches']} 场 · {prof['wins']} 胜 {prof['losses']} 负 "
+            f"{prof['draws']} 平 · 胜率 {prof['win_rate']}%")
+        self.log_box.append_line(
+            f"  K/D {prof['kills']}/{prof['deaths']} · KDA {prof['avg_kda']} · "
+            f"爆头 {prof['headshots']} · MVP {prof['mvps']}")
+        if prof["best_by_mode"]:
+            bests = "  ".join(f"{k}:{v}" for k, v in prof["best_by_mode"].items())
+            self.log_box.append_line(f"  各模式最佳：{bests}")
+        self.log_box.append_line(
+            f"  成就 {len(prof['achievements'])}/{prof['achievement_total']}")
+        for row in prof["history"][:3]:
+            self.log_box.append_line(
+                f"   {row.get('ts')}  {row.get('mode')}  {row.get('win')}  "
+                f"K{row.get('kills')}/D{row.get('deaths')}  分数 {row.get('score')}")
 
     # ---------- 我的页 ----------
     def _build_profile_page(self):
@@ -1888,6 +2179,17 @@ class LauncherWindow(QWidget):
         info_col.addStretch(1)
         score_row.addLayout(info_col)
         score_card.content.addLayout(score_row)
+
+        # 成长与统计（A-2）：等级 / XP / 场次 / 胜率 / KDA / 成就
+        self.lbl_level = QLabel("Lv.1  ·  XP 0")
+        self.lbl_level.setStyleSheet(f"color:{C_ACCENT}; font-size:15px; font-weight:700;")
+        self.lbl_stats = QLabel("0 场 · 胜率 0.0% · KDA 0.0")
+        self.lbl_stats.setStyleSheet(f"color:{C_TEXT}; font-size:12px;")
+        self.lbl_stats2 = QLabel("成就 0/14")
+        self.lbl_stats2.setObjectName("Hint")
+        score_card.content.addWidget(self.lbl_level)
+        score_card.content.addWidget(self.lbl_stats)
+        score_card.content.addWidget(self.lbl_stats2)
         lay.addWidget(score_card)
 
         # 客户端卡
@@ -2166,6 +2468,36 @@ class LauncherWindow(QWidget):
             QMessageBox.warning(self, "修复失败", message)
 
     # ---------- 设置 ----------
+    def _volume_row(self, grid, row, title, label_attr):
+        grid.addWidget(self._label(title), row, 0)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.valueChanged.connect(self._on_vol_changed)
+        slider.sliderReleased.connect(self.save_settings_from_ui)
+        grid.addWidget(slider, row, 1)
+        lbl = QLabel("100%")
+        lbl.setFixedWidth(44)
+        lbl.setStyleSheet(f"color:#D7E1EE; font-family:'{FONT_NUM}'; font-size:14px; font-weight:600;")
+        setattr(self, label_attr, lbl)
+        grid.addWidget(lbl, row, 2)
+        return slider
+
+    def _fill_look_combos(self, settings):
+        """准星/涂装只列出当前等级已解锁的项（与游戏内一致）。"""
+        profile = read_profile(self.game_dir)
+        cross = growth.unlocked_crosshairs(profile)
+        skins = growth.unlocked_skins(profile)
+        for combo, values, table, current in (
+                (self.combo_cross, cross, growth.CROSSHAIR_CN, settings.get("crosshair")),
+                (self.combo_skin, skins, growth.SKIN_CN, settings.get("skin"))):
+            combo.blockSignals(True)
+            combo.clear()
+            for val in values:
+                combo.addItem(table.get(val, val), val)
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
     def _load_settings_into_ui(self, settings):
         size = (int(settings["window_width"]), int(settings["window_height"]))
         index = self.combo_size.findData(size)
@@ -2185,26 +2517,59 @@ class LauncherWindow(QWidget):
         self.slider_sens.blockSignals(False)
         self.lbl_sens.setText(str(int(round(settings["sensitivity"]))))
 
-        self.slider_vol.blockSignals(True)
-        self.slider_vol.setValue(int(round(settings["volume"] * 100)))
-        self.slider_vol.blockSignals(False)
-        self.lbl_vol.setText(f"{int(round(settings['volume'] * 100))}%")
+        for slider, lbl, key in ((self.slider_vol, self.lbl_vol, "volume"),
+                                 (self.slider_sfx, self.lbl_sfx, "volume_sfx"),
+                                 (self.slider_ui, self.lbl_ui, "volume_ui")):
+            val = float(settings.get(key, 1.0))
+            slider.blockSignals(True)
+            slider.setValue(int(round(val * 100)))
+            slider.blockSignals(False)
+            lbl.setText(f"{int(round(val * 100))}%")
+
+        self.sw_killcam.blockSignals(True)
+        self.sw_killcam.setChecked(bool(settings.get("killcam", False)), animate=False)
+        self.sw_killcam.blockSignals(False)
+
+        qidx = self.combo_quality.findData(settings.get("quality", "medium"))
+        self.combo_quality.blockSignals(True)
+        self.combo_quality.setCurrentIndex(qidx if qidx >= 0 else 1)
+        self.combo_quality.blockSignals(False)
+
+        self._fill_look_combos(settings)
 
     def _on_sens_changed(self, value):
         self.lbl_sens.setText(str(value))
 
     def _on_vol_changed(self, value):
-        self.lbl_vol.setText(f"{value}%")
+        # 三个音量滑块的 label 由各自 slider 决定（sender 判断）
+        sender = self.sender()
+        if sender is getattr(self, "slider_sfx", None):
+            self.lbl_sfx.setText(f"{value}%")
+        elif sender is getattr(self, "slider_ui", None):
+            self.lbl_ui.setText(f"{value}%")
+        else:
+            self.lbl_vol.setText(f"{value}%")
 
     def _collect_settings(self):
         w, h = self.combo_size.currentData() or (1600, 900)
-        return {
+        settings = dict(DEFAULT_GAME_SETTINGS)
+        # 保留游戏写入、启动器不管理的字段（keymap/resolution 等）
+        settings.update(read_game_settings(self.game_dir))
+        settings.update({
             "window_width": int(w),
             "window_height": int(h),
+            "resolution": "",          # 启动器以窗口尺寸为准（游戏内改分辨率会写回这里）
             "fullscreen": bool(self.sw_fullscreen.isChecked()),
             "sensitivity": float(self.slider_sens.value()),
             "volume": round(self.slider_vol.value() / 100.0, 2),
-        }
+            "volume_sfx": round(self.slider_sfx.value() / 100.0, 2),
+            "volume_ui": round(self.slider_ui.value() / 100.0, 2),
+            "crosshair": self.combo_cross.currentData() or "cross",
+            "quality": self.combo_quality.currentData() or "medium",
+            "skin": self.combo_skin.currentData() or "default",
+            "killcam": bool(self.sw_killcam.isChecked()),
+        })
+        return settings
 
     def save_settings_from_ui(self, *args):
         if write_game_settings(self.game_dir, self._collect_settings()):
@@ -2220,9 +2585,23 @@ class LauncherWindow(QWidget):
     # ---------- 战绩 ----------
     def _refresh_scores(self):
         data = read_scores(self.game_dir)
-        self.lbl_best.setText(str(data.get("best", 0) or 0))
-        self.lbl_last.setText(f"最近一局  {data.get('last', 0) or 0}")
+        prof = growth.summary(read_profile(self.game_dir))
+        best = max(list(prof["best_by_mode"].values()) or [data.get("best", 0) or 0])
+        self.lbl_best.setText(str(best))
+        last = (prof["history"][0] if prof["history"] else None)
+        self.lbl_last.setText(
+            f"最近一局  {last.get('score', 0)}" if last
+            else f"最近一局  {data.get('last', 0) or 0}")
         self.lbl_when.setText(data.get("updated") or "暂无记录")
+        self.lbl_level.setText(f"Lv.{prof['level']}  ·  XP {prof['xp']}"
+                               f"（{prof['xp_text']}）")
+        self.lbl_stats.setText(
+            f"{prof['matches']} 场 · {prof['wins']} 胜 {prof['losses']} 负 · "
+            f"胜率 {prof['win_rate']}% · KDA {prof['avg_kda']}")
+        self.lbl_stats2.setText(
+            f"击杀 {prof['kills']} · 爆头 {prof['headshots']} · "
+            f"MVP {prof['mvps']} · 成就 "
+            f"{len(prof['achievements'])}/{prof['achievement_total']}")
 
     # ---------- 启动 / 模式选择 ----------
 
@@ -2783,12 +3162,14 @@ def _pump(app, frames=160, delay=0.03):
         time.sleep(delay)
 
 
-def run_screenshot(path):
+def run_screenshot(path, page=None):
     global SCREENSHOT_MODE
     SCREENSHOT_MODE = True
     app = QApplication.instance() or QApplication(sys.argv)
     win = LauncherWindow(nickname="Ghost_07")
     win.show()
+    if page:
+        win._switch_page(page)
     screen_w = app.primaryScreen().geometry().width()
     win.move(screen_w + 200, 100)  # 移到屏幕外，不干扰用户
     _pump(app)
@@ -2852,7 +3233,11 @@ def main():
     if "--screenshot" in argv:
         idx = argv.index("--screenshot")
         out = argv[idx + 1] if idx + 1 < len(argv) else "launcher.png"
-        return run_screenshot(out)
+        page = None
+        if "--page" in argv:
+            pidx = argv.index("--page")
+            page = argv[pidx + 1] if pidx + 1 < len(argv) else None
+        return run_screenshot(out, page)
     if "--shot-login" in argv:
         idx = argv.index("--shot-login")
         out = argv[idx + 1] if idx + 1 < len(argv) else "login.png"

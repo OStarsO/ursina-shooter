@@ -56,6 +56,7 @@ import bots as BOTS_MODULE
 import remote_actors as REMOTE
 import winfix
 import shop as SHOP_MODULE
+import growth
 from combat import (Player, Weapon, Melee, ZONE_MULTIPLIERS, zone_damage,
                     classify_zone_by_height, ZONE_CN)
 from weapons.config import (CATALOG as WEAPON_CATALOG, ORDER as WEAPON_ORDER,
@@ -157,6 +158,7 @@ ClockObject.getGlobalClock().setMaxDt(1.0 / 30.0)
 # ===================== 设置 / 战绩 =====================
 SETTINGS_FILE = os.path.join(BASE_DIR, 'settings.json')
 SCORES_FILE = os.path.join(BASE_DIR, 'scores.json')
+PROFILE_FILE = os.path.join(BASE_DIR, 'profile.json')
 
 DEFAULT_SETTINGS = {
     'window_width': 1600,
@@ -170,6 +172,7 @@ DEFAULT_SETTINGS = {
     'quality': 'medium',    # low / medium / high
     'resolution': '',       # '1600x900'；空 = 用 window_width/height
     'killcam': False,       # 死亡后镜头切到击杀者
+    'skin': 'default',      # 武器涂装（等级解锁）
     'keymap': {},           # 自定义键位（动作 -> 键名）
 }
 
@@ -223,8 +226,52 @@ def save_settings():
         pass
 
 
+def load_profile():
+    """读取成长档案（profile.json）；缺失/损坏时返回默认结构。"""
+    try:
+        with open(PROFILE_FILE, 'r', encoding='utf-8') as f:
+            return growth.normalize(json.load(f))
+    except (OSError, ValueError):
+        return growth.default_profile()
+
+
+def save_profile(profile=None):
+    """原子写入成长档案，并同步一份 legacy scores.json（启动器旧字段兼容）。"""
+    profile = PROFILE if profile is None else profile
+    try:
+        tmp = PROFILE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PROFILE_FILE)
+    except OSError as exc:
+        print('[战绩] 写入 profile.json 失败:', exc)
+        return False
+    try:
+        row = (profile.get('history') or [{}])[0]
+        best = max(list((profile.get('best_by_mode') or {}).values()) or [0])
+        legacy = {
+            'best': int(best),
+            'last': int(row.get('score', 0)),
+            'updated': profile.get('updated') or '',
+            'matches': int(profile.get('matches', 0)),
+            'wins': int(profile.get('wins', 0)),
+            'win_rate': round(100.0 * profile.get('wins', 0)
+                              / max(1, profile.get('matches', 1)), 1),
+            'level': int(profile.get('level', 1)),
+            'xp': int(profile.get('xp', 0)),
+        }
+        with open(SCORES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(legacy, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return True
+
+
 def save_score(current_score):
-    """记录本局得分与历史最高分，供启动器展示"""
+    """局中轻量更新（best/last），不触碰 profile 的场次/历史统计。
+
+    完整落盘由 end_match() 的 record_match() 负责，避免"只在击杀时写盘"。
+    """
     try:
         data = {'best': 0, 'last': 0, 'updated': ''}
         if os.path.exists(SCORES_FILE):
@@ -244,7 +291,41 @@ def save_score(current_score):
         pass
 
 
+PROFILE = load_profile()
+# 本局统计（结算时一次性写入档案）
+MATCH_STATS = {'headshots': 0, 'streak': 0, 'max_streak': 0, 'start_kills': 0,
+               'start_deaths': 0, 'start_ts': time.time()}
+
+
+def _reset_match_stats():
+    MATCH_STATS.update({
+        'headshots': 0, 'streak': 0, 'max_streak': 0,
+        'start_kills': state.kills, 'start_deaths': state.deaths,
+        'start_ts': time.time(),
+    })
+
+
+def _note_kill(zone='body'):
+    """本局击杀记账：连杀计数 + 爆头计数（供成长/成就判定）。"""
+    MATCH_STATS['streak'] += 1
+    MATCH_STATS['max_streak'] = max(MATCH_STATS['max_streak'], MATCH_STATS['streak'])
+    if zone == 'head':
+        MATCH_STATS['headshots'] += 1
+
+
+def _note_death():
+    MATCH_STATS['streak'] = 0
+
+
+def _profile_summary():
+    return growth.summary(PROFILE)
+
+
 SETTINGS = load_settings()
+if SETTINGS.get('skin', 'default') == 'default':
+    SETTINGS['skin'] = PROFILE.get('skin', 'default')
+SETTINGS['unlocked_crosshair'] = growth.unlocked_crosshairs(PROFILE)
+SETTINGS['unlocked_skin'] = growth.unlocked_skins(PROFILE)
 KEYMAP = dict(KEYMAP_DEFAULT)
 KEYMAP.update({k: v for k, v in (SETTINGS.get('keymap') or {}).items()
                if isinstance(v, str) and v})
@@ -591,6 +672,10 @@ def owned_keys():
 
 viewmodel = Viewmodel(camera, on_switch=on_weapon_switch)
 viewmodel.set_available(owned_keys())     # 背包规则：只有配装里的武器可切换
+try:
+    viewmodel.apply_skin(SETTINGS.get('skin', 'default'))
+except Exception as _exc:  # noqa: BLE001
+    print('[涂装] 应用失败:', _exc)
 weapon = ARMS[viewmodel.active_key]
 
 # 地图模式出生点：单挑 → 1 号点；团队 → 红队底线 1 号位（面向蓝队半场）
@@ -672,6 +757,12 @@ def apply_resolution(text):
 
 def apply_setting(key, value):
     """设置项立即生效并写回 settings.json（启动器也读这个文件）。"""
+    if key == 'crosshair':
+        allowed = SETTINGS.get('unlocked_crosshair') or ['cross']
+        if value not in allowed:
+            hud.banner(f'准星「{growth.CROSSHAIR_CN.get(value, value)}」需等级解锁',
+                       1.6, T.C_WARN)
+            return
     SETTINGS[key] = value
     if key == 'sensitivity':
         player.mouse_sensitivity = Vec2(float(value), float(value))
@@ -681,6 +772,8 @@ def apply_setting(key, value):
         window.fullscreen = bool(value)
     elif key == 'crosshair':
         hud.set_crosshair(value)
+    elif key == 'skin':
+        viewmodel.apply_skin(value)
     elif key == 'quality':
         apply_quality(value)
     elif key == 'resolution':
@@ -753,6 +846,9 @@ killcam_pos = None              # 死亡镜头看向的世界坐标
 killcam_name = ''
 _death_shown = -1               # 已展示死亡面板的死亡序号（state.deaths）
 remote_world = REMOTE.RemoteWorld() if NET_INFO.get('net-mode') else None
+_armband = None
+_prev_alive = True
+_last_speed_warn = 0.0
 
 
 def _weapon_cn(key):
@@ -813,6 +909,7 @@ def _reset_match(game=None):
     state.score = 0
     state.kills = 0
     state.deaths = 0
+    _reset_match_stats()
     results_page.hide()
     death_panel.hide()
     if not state.alive:
@@ -823,8 +920,85 @@ def _reset_match(game=None):
     hud.banner('对局开始', 1.6, T.C_OK)
 
 
+def _match_mode_key():
+    if NET_INFO.get('net-mode') or NET_INFO.get('mode'):
+        return NET_INFO.get('mode') or 'training'
+    if DUEL:
+        return 'duel'
+    if TEAM:
+        return 'team5'
+    return 'training'
+
+
+def _settle_match(result):
+    """每局结算：统计本局 → growth 结算（XP/成就/解锁）→ 立即落盘。"""
+    if SHOT_PATH:                      # 出图模式不写档
+        return None
+    kills = max(0, state.kills - MATCH_STATS['start_kills'])
+    deaths = max(0, state.deaths - MATCH_STATS['start_deaths'])
+    score = int(state.score)
+    my_team = (MY_TEAM if NET_INFO.get('net-mode') else ('red' if TEAM else 'T'))
+    winner = str((result or {}).get('winner') or '')
+    mode_key = _match_mode_key()
+    if mode_key == 'training' and not NET_INFO.get('net-mode'):
+        outcome = 'draw'          # 训练场没有对手阵营，不计胜负（防刷胜率）
+    elif not winner:
+        outcome = 'draw'
+    elif (my_team == 'blue' and winner == 'blue') or \
+            (my_team != 'blue' and winner in ('red', 'T')):
+        outcome = 'win'
+    else:
+        outcome = 'loss'
+    mvp_name = ((result or {}).get('mvp') or {}).get('name')
+    match = {
+        'mode': mode_key, 'win': outcome, 'score': score,
+        'kills': kills, 'deaths': deaths, 'assists': 0,
+        'headshots': MATCH_STATS['headshots'],
+        'max_streak': MATCH_STATS['max_streak'],
+        'mvp': mvp_name == NICKNAME,
+        'duration': int(time.time() - MATCH_STATS['start_ts']),
+    }
+    summary = growth.apply_match(PROFILE, match)
+    save_profile(PROFILE)              # 立即完整落盘（退出/断电不丢本局）
+    _reset_match_stats()
+    print(f"[战绩] 已落盘：{match['mode']} {outcome} K{kills}/D{deaths} "
+          f"XP+{summary['xp']} → Lv.{summary['level']}")
+    return summary
+
+
+def _apply_armband():
+    """等级臂章：第三人称模型胸前的纯装饰色块。"""
+    global _armband
+    try:
+        if _armband is not None:
+            destroy(_armband)
+            _armband = None
+        band = PROFILE.get('armband', 'default')
+        if character is None or band == 'default':
+            return
+        col = {'veteran': (226, 168, 62), 'elite': (96, 176, 250)}.get(band, (200, 200, 200))
+        _armband = Entity(parent=character, model='quad', scale=(0.22, 0.10),
+                          position=(0.16, 1.24, -0.14),
+                          color=color.rgba32(col[0], col[1], col[2], 235))
+    except Exception as exc:  # noqa: BLE001
+        print('[臂章] 应用失败:', exc)
+
+
+def _refresh_unlocks():
+    """等级变化后刷新解锁（准星白名单 / 涂装 / 臂章）。"""
+    SETTINGS['unlocked_crosshair'] = growth.unlocked_crosshairs(PROFILE)
+    SETTINGS['unlocked_skin'] = growth.unlocked_skins(PROFILE)
+    if SETTINGS.get('crosshair') not in SETTINGS['unlocked_crosshair']:
+        SETTINGS['crosshair'] = 'cross'
+        hud.set_crosshair('cross')
+    skin = PROFILE.get('skin', 'default')
+    SETTINGS['skin'] = skin
+    viewmodel.apply_skin(skin)
+    _apply_armband()
+
+
 def end_match(result, reason='time'):
-    """回合结束：冻结操作 + 弹出结算页（单机与联机共用同一套 UI）。"""
+    """回合结束：结算落盘 + 冻结操作 + 弹出结算页（单机与联机共用）。"""
     global match_ended
     if match_ended:
         return
@@ -843,8 +1017,15 @@ def end_match(result, reason='time'):
                   'rows': rows,
                   'winner': ('red' if red > blue else 'blue' if blue > red else ''),
                   'mvp': {'name': NICKNAME, 'team': 'red', 'score': red}}
-    results_page.show_result(result)
+    summary = _settle_match(result)
+    results_page.show_result(result, growth=summary)
     hud.banner('对局结束', 2.0, T.C_ACCENT)
+    if summary:
+        for ach in summary.get('achievements') or []:
+            hud.banner(f"成就解锁：{ach['name']}", 2.4, T.C_ACCENT)
+        if summary.get('level_up'):
+            hud.banner(f"等级提升 → Lv.{summary['level']}", 2.6, T.C_OK)
+        _refresh_unlocks()
 
 
 def _end_if_needed():
@@ -933,6 +1114,7 @@ def _handle_net_event(ev):
         victim = ev.get('victim')
         zone_cn = ZONE_CN.get(ev.get('zone'), '')
         if ev.get('killer') == me:
+            _note_kill(ev.get('zone') or 'body')
             hud.push_kill(f'{ev.get("victim_name", "目标")}（{zone_cn}）', 10)
             hud.on_fire(hit=True, kill=True)
         if victim == me:
@@ -943,6 +1125,14 @@ def _handle_net_event(ev):
             })
             if state.alive:
                 state.die()
+    elif kind == 'speed_warn':
+        if ev.get('id') == me:
+            global _last_speed_warn
+            now = time.time()
+            if now - _last_speed_warn > 3.0:
+                _last_speed_warn = now
+                hud.banner(f"移动超速 {ev.get('speed', 0)} m/s，已被服务器回拉",
+                           1.8, T.C_WARN)
     elif kind == 'blocked':
         if ev.get('victim') == me:
             hud.banner('无敌：已挡下伤害', 1.0, T.C_WARN)
@@ -1051,6 +1241,7 @@ def kill_target(entity, points=10):
     destroy(entity)
     state.score += points
     state.kills += 1
+    _note_kill('body')
     hud.on_fire(hit=True, kill=True)
     hud.push_kill('目标', points)
     save_score(state.score)
@@ -1097,6 +1288,7 @@ def hit_dummy(dummy, part_entity, base_damage):
     if killed:
         state.score += 10
         state.kills += 1
+        _note_kill(zone)
         hud.on_fire(hit=True, kill=True)
         hud.push_kill(f'木偶人 · {ZONE_CN[zone]}', 10)
         save_score(state.score)
@@ -1126,6 +1318,7 @@ def hit_bot(bot, hit_point, base_damage):
     if killed:
         state.score += 10
         state.kills += 1
+        _note_kill(zone)
         hud.push_kill(f'{bot.name}（{ZONE_CN[zone]}）', 10)
         save_score(state.score)
         # 团队/单挑胜利条件：击倒人机计入我方分数
@@ -1479,6 +1672,10 @@ def update():
         respawn_player()
         hud.banner('已回到出生点', 1.2, T.C_WARN)
 
+    global _prev_alive
+    if _prev_alive and not state.alive:
+        _note_death()
+    _prev_alive = state.alive
     if not state.alive:
         player.enabled = False
         if mouse.locked:
@@ -1549,6 +1746,11 @@ def update():
     if scoreboard.visible:
         scoreboard.refresh()
 
+
+try:
+    _apply_armband()                   # 等级臂章（character 已装配完成后）
+except Exception:
+    pass
 
 # ===================== 自检出图 =====================
 if SHOT_PATH:
@@ -1690,7 +1892,17 @@ if SHOT_PATH:
                          'assists': 0, 'score': 70},
                     ],
                     'mvp': {'name': NICKNAME, 'team': 'red', 'score': 180}}
-            invoke(lambda: results_page.show_result(_res), delay=0.40)
+            _growth_demo = {'xp': 168, 'total_xp': 1068, 'level': 6, 'old_level': 5,
+                            'level_up': True, 'level_text': 'Lv.6',
+                            'xp_text': '168/520', 'progress': 32,
+                            'achievements': [{'id': 'triple_kill', 'name': '三杀',
+                                              'desc': '单局击杀 3 人'},
+                                             {'id': 'sharp_eye', 'name': '精准射手',
+                                              'desc': '单局爆头 5 次'}],
+                            'unlocks': [{'level': 6, 'text': ''}],
+                            'matches': 24, 'win_rate': 58.3, 'avg_kda': 2.4,
+                            'skin': 'digital', 'armband': 'veteran'}
+            invoke(lambda: results_page.show_result(_res, growth=_growth_demo), delay=0.40)
             invoke(_snap, delay=0.85)
             return
         if SHOT_VIEW == 'death':
@@ -2014,6 +2226,20 @@ if SELFTEST:
         ok.append(('tp 指令生效', abs(player.x - 3.0) < 0.2 and abs(player.z - 5.0) < 0.2))
         player.position = (_px, player.y, _pz)
 
+        # ---- 解锁拦截 / 涂装 ----
+        _cross_before = SETTINGS.get('crosshair', 'cross')
+        if 'thick' not in (SETTINGS.get('unlocked_crosshair') or []):
+            apply_setting('crosshair', 'thick')
+            ok.append(('未解锁准星被拦截', SETTINGS.get('crosshair') == _cross_before))
+        else:
+            ok.append(('未解锁准星被拦截', True))
+        try:
+            viewmodel.apply_skin('carbon')
+            viewmodel.apply_skin(SETTINGS.get('skin', 'default'))
+            ok.append(('武器涂装可应用', True))
+        except Exception:  # noqa: BLE001
+            ok.append(('武器涂装可应用', False))
+
         # ---- 结算页 / 死亡面板 ----
         results_page.show_result({
             'reason': 'score', 'winner': 'red',
@@ -2030,6 +2256,50 @@ if SELFTEST:
                     'BOT-B1' in death_panel.lbl_killer.text
                     and '头部' in death_panel.lbl_zone.text))
         death_panel.hide()
+
+        # ---- 成长 / 成就 / 结算落盘 ----
+        import copy as _copy
+        _backup = _copy.deepcopy(PROFILE)
+        _bak_file = PROFILE_FILE + '.selftest.bak'
+        try:
+            if os.path.exists(PROFILE_FILE):
+                import shutil as _sh
+                _sh.copy2(PROFILE_FILE, _bak_file)
+            _before = int(PROFILE.get('matches', 0))
+            _sum = _settle_match({'winner': 'red', 'score': {'red': 5, 'blue': 2},
+                                  'rows': [], 'mvp': {'name': NICKNAME}})
+            _loaded = load_profile()
+            ok.append(('结算立即完整落盘',
+                       _loaded.get('matches', 0) == _before + 1
+                       and _loaded.get('history')))
+            _last = (_loaded.get('history') or [{}])[0]
+            ok.append(('历史记录含胜负与KDA字段',
+                       all(k in _last for k in ('mode', 'win', 'kills', 'deaths', 'score'))))
+            ok.append(('结算发放 XP 并升级判定', _sum and _sum['xp'] > 0
+                       and _sum['level'] >= 1))
+            if os.path.exists(_bak_file):
+                import shutil as _sh2
+                _sh2.copy2(_bak_file, PROFILE_FILE)
+                os.remove(_bak_file)
+            else:
+                try:
+                    os.remove(PROFILE_FILE)
+                except OSError:
+                    pass
+            PROFILE.clear()
+            PROFILE.update(_backup)
+        except Exception as _exc:  # noqa: BLE001
+            ok.append(('结算落盘流程', False))
+            print('[selftest] 结算落盘检查失败:', _exc)
+
+        _fake = growth.default_profile()
+        _sum2 = growth.apply_match(_fake, {
+            'mode': 'team5', 'win': 'win', 'score': 60, 'kills': 5, 'deaths': 1,
+            'assists': 1, 'headshots': 5, 'max_streak': 5, 'mvp': True, 'duration': 120})
+        _ids = {a['id'] for a in _sum2['achievements']}
+        ok.append(('成就：首杀/三杀/精准射手/五连杀',
+                   {'first_blood', 'triple_kill', 'sharp_eye', 'penta_kill'} <= _ids))
+        ok.append(('历史最多保留 20 局', len(_fake['history']) == 1))
 
         state.take_damage(999)
         ok.append(('死亡状态', not state.alive))

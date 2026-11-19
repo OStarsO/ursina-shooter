@@ -127,6 +127,10 @@ class World:
             x = max(-cover_map.BOUND, min(cover_map.BOUND, float(pos[0])))
             z = max(-cover_map.BOUND, min(cover_map.BOUND, float(pos[2])))
             y = max(cover_map.Y_MIN, min(cover_map.Y_MAX, float(pos[1])))
+            x, z, warned = self._check_speed(e, x, z)
+            if warned:
+                self.events.append({"t": "speed_warn", "id": e["id"],
+                                    "speed": round(warned, 1)})
             e["pos"] = [x, y, z]
             e["yaw"] = float(data.get("yaw", e["yaw"]))
             e["pitch"] = float(data.get("pitch", e["pitch"]))
@@ -140,6 +144,34 @@ class World:
         except (TypeError, ValueError, IndexError):
             return False
         return True
+
+    # 客户端上报间隔约 50ms；允许跳跃/斜坡的短暂超速，这里给 1.6 倍余量
+    SPEED_BASE = 8.0
+    SPEED_TOLERANCE = 1.6
+    SPEED_EXTRA = 2.0
+
+    def _check_speed(self, e, x, z):
+        """水平位移/时间 超过上限 → 夹取并返回 (x, z, 实测速度)。"""
+        now = self.seq_t()
+        prev = e.get("_state_pos") or (e["pos"][0], e["pos"][2])
+        prev_t = e.get("_state_t")
+        dt = max(0.02, min(0.5, now - prev_t)) if prev_t is not None else 0.05
+        dist = math.hypot(x - prev[0], z - prev[1])
+        max_speed = (self.SPEED_BASE * float(e.get("speed_mult", 1.0))
+                     * self.SPEED_TOLERANCE + self.SPEED_EXTRA)
+        limit = max_speed * dt
+        warned = 0.0
+        if e.pop("_tp_allow", False):
+            pass                              # 传送后首个状态不做校验
+        elif dist > limit and dist > 0.6:
+            k = limit / dist
+            x = prev[0] + (x - prev[0]) * k
+            z = prev[1] + (z - prev[1]) * k
+            warned = dist / dt
+            e["speed_hits"] = e.get("speed_hits", 0) + 1
+        e["_state_pos"] = (x, z)
+        e["_state_t"] = now
+        return x, z, warned
 
     def fire(self, mid, origin, direction):
         """一次开火：射速校验 → 弹道 → 伤害。返回事件 dict 或 None。"""
@@ -240,6 +272,8 @@ class World:
             return False
         e["pos"][0] = max(-cover_map.BOUND, min(cover_map.BOUND, float(x)))
         e["pos"][2] = max(-cover_map.BOUND, min(cover_map.BOUND, float(z)))
+        e["_tp_allow"] = True
+        e["_state_pos"] = (e["pos"][0], e["pos"][2])
         return True
 
     def set_god(self, ids, on=True):
@@ -287,6 +321,9 @@ class World:
         e["alive"] = True
         e["respawn_t"] = 0.0
         e["ai"]["react_left"] = e["ai"]["cfg"]["react"]
+        e["_state_pos"] = (e["pos"][0], e["pos"][2])
+        e["_state_t"] = self.seq_t()
+        e["_tp_allow"] = True
         self.events.append({"t": "respawn", "id": e["id"]})
 
     def _bot_tick(self, e, dt):

@@ -21,6 +21,7 @@ logs/
 *.log
 settings.json
 scores.json
+profile.json
 hit.wav
 hit.ogg
 # 程序化生成的 UI 贴图，运行时重建

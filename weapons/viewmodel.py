@@ -181,6 +181,21 @@ class Viewmodel(Entity):
         self._stop_tracks()
         return True
 
+    # 涂装：仅改变枪模色调（等级解锁的纯外观项）
+    SKIN_TINTS = {'default': (1.0, 1.0, 1.0),
+                  'digital': (0.62, 0.66, 0.52),
+                  'carbon': (0.38, 0.40, 0.46)}
+
+    def apply_skin(self, name='default'):
+        """按名称给所有枪模上色（失败静默，不影响手感/数值）。"""
+        tint = self.SKIN_TINTS.get(name, (1.0, 1.0, 1.0))
+        for model in self.models.values():
+            try:
+                for gn in model.pivot.findAllMatches('**/+GeomNode'):
+                    gn.setColorScale(*tint, 1.0)
+            except Exception:  # noqa: BLE001
+                pass
+
     def cycle(self, step=1):
         owned = [k for k in self.order if k in self.available]
         if not owned or self.active_key not in owned:
